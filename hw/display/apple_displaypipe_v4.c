@@ -145,6 +145,8 @@ struct AppleDisplayPipeV4State
     QemuConsole*        console;
     QEMUBH*             update_disp_image_bh;
     QEMUTimer*          boot_splash_timer;
+    /* When the display pipe last put a frame up; see adp_v4_gfx_update. */
+    int64_t             last_present_ns;
 };
 
 // clang-format off
@@ -564,12 +566,37 @@ static void adp_v4_vsync_start(AppleDisplayPipeV4State* adp)
     timer_mod_ns(adp->vsync_timer, adp->next_vsync_ns);
 }
 
+/*
+ * How long after the last frame from the display pipe the framebuffer is still
+ * assumed to be the pipe's to draw. Long enough to cover a slow frame, short
+ * enough that a guest which goes back to writing the framebuffer itself -- the
+ * panic screen does -- is picked up within the blink of an eye.
+ */
+#define ADP_V4_PIPE_IDLE_NS (500 * SCALE_MS)
+
 static void adp_v4_gfx_update(void* opaque)
 {
     AppleDisplayPipeV4State* adp = opaque;
     DirtyBitmapSnapshot*     snap;
     bool                     dirty;
     uint32_t                 y, ys;
+    int64_t                  last;
+
+    /*
+     * Scanning the framebuffer for what the guest wrote is only of use while
+     * the guest writes it: before the display pipe starts, and if it ever
+     * stops. Once the pipe is running, the frames come from it -- it composites
+     * into this same buffer and says which rows changed -- and the scan finds
+     * nothing.
+     *
+     * It is not free either. Taking the dirty snapshot clears the log, and
+     * clearing it walks every entry of every mmu index of every cpu's TLB
+     * (tlb_reset_dirty_range_all) holding each one's lock, thirty times a
+     * second, against vcpus that need those same locks to fill a TLB entry.
+     */
+    /* Both this and the frame bottom half run on the main loop. */
+    last = adp->last_present_ns;
+    if (last != 0 && qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - last < ADP_V4_PIPE_IDLE_NS) { return; }
 
     snap = memory_region_snapshot_and_clear_dirty(adp->vram_mr, adp->vram_off + adp->fb_off,
                                                   adp->height * adp->width * sizeof(uint32_t), DIRTY_MEMORY_VGA);
@@ -843,6 +870,8 @@ static void adp_v4_update_disp_bh(void* opaque)
     disp_image = qemu_console_surface(adp->console)->image;
 
     for (i = 0; i < ADP_V4_GP_COUNT; ++i) { adp_v4_gp_draw(&adp->genpipe[i], &adp->dma_as, disp_image, adp->console); }
+
+    adp->last_present_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 
     qatomic_or(&adp->int_status, R_CONTROL_INT_FRAME_PROCESSED_MASK);
     adp_v4_update_irqs(adp);
