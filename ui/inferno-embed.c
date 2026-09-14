@@ -20,12 +20,14 @@
 
 #include "qemu/osdep.h"
 #include "qemu/lockable.h"
+#include "qemu/timer.h"
 #include "qemu/main-loop.h"
 #include "qemu/thread.h"
 #include "ui/console.h"
 #include "ui/inferno-embed.h"
 #include "ui/input.h"
 #include "ui/surface.h"
+#include "system/system.h"
 
 /*
  * The app reads frames from its own thread while QEMU redraws them on the main
@@ -54,6 +56,10 @@ static DisplayChangeListener      inferno_dcl;
 /* Counted under the display's own lock; see InfernoDisplayStats. */
 static uint64_t inferno_presents;
 static uint64_t inferno_refreshes;
+/* Bench rig only: the spacing between frames, to tell a cap from a slow guest. */
+static int64_t  inferno_last_present_ns;
+static int64_t  inferno_gap_min_ns, inferno_gap_max_ns, inferno_gap_sum_ns;
+static uint64_t inferno_gap_count;
 
 static void damage_all_locked(InfernoDisplay* d)
 {
@@ -118,7 +124,32 @@ void inferno_display_note_present(void)
     InfernoDisplay* d = &inferno_display;
 
     if (!d->attached) { return; }
-    WITH_QEMU_LOCK_GUARD(&d->lock) { inferno_presents++; }
+    WITH_QEMU_LOCK_GUARD(&d->lock)
+    {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+        inferno_presents++;
+        if (inferno_last_present_ns != 0) {
+            int64_t gap = now - inferno_last_present_ns;
+
+            if (inferno_gap_count == 0 || gap < inferno_gap_min_ns) { inferno_gap_min_ns = gap; }
+            if (inferno_gap_count == 0 || gap > inferno_gap_max_ns) { inferno_gap_max_ns = gap; }
+            inferno_gap_sum_ns += gap;
+            inferno_gap_count++;
+        }
+        inferno_last_present_ns = now;
+    }
+}
+
+static void inferno_display_gaps(int64_t* min_ms, int64_t* mean_ms, int64_t* max_ms)
+{
+    InfernoDisplay* d = &inferno_display;
+
+    QEMU_LOCK_GUARD(&d->lock);
+    *min_ms  = inferno_gap_count ? inferno_gap_min_ns / SCALE_MS : 0;
+    *max_ms  = inferno_gap_count ? inferno_gap_max_ns / SCALE_MS : 0;
+    *mean_ms = inferno_gap_count ? (inferno_gap_sum_ns / (int64_t)inferno_gap_count) / SCALE_MS : 0;
+    inferno_gap_count = inferno_gap_sum_ns = 0;
 }
 
 void inferno_display_stats(InfernoDisplayStats* out)
@@ -303,3 +334,70 @@ void inferno_input_function_key(uint32_t number, bool pressed)
     qemu_input_event_send_key_qcode(NULL, code, pressed);
     bql_unlock();
 }
+
+/* ------------------------------------------------------------------ */
+/* Frame counting with no window, for the bench rig                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The app is what normally drives the machine's redraw: attaching a listener
+ * starts the refresh timer, and every frame the guest presents is counted. A
+ * headless run has no listener at all, so the display pipe never runs and the
+ * frame rate cannot be measured outside the app -- which is exactly what a
+ * comparison between two builds of the emulator needs.
+ *
+ * INFERNO_HEADLESS_FPS=1 attaches the same listener from inside the emulator
+ * and reads frames the way the app's pump does, then prints a line a second:
+ *
+ *   INFERNO-FPS <second> presents=<n> refreshes=<n>
+ *
+ * Off unless the variable is set, so nothing changes for the app.
+ */
+static void inferno_display_gaps(int64_t* min_ms, int64_t* mean_ms, int64_t* max_ms);
+
+static void* inferno_headless_pump(void* arg)
+{
+    InfernoFrameInfo  info;
+    InfernoDisplayStats stats;
+    void*             buf  = NULL;
+    size_t            size = 0;
+    int64_t           next;
+    int64_t           gmin = 0, gmean = 0, gmax = 0;
+    uint64_t          second = 0;
+
+    next = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1000;
+    for (;;) {
+        if (inferno_display_read(buf, size, &info) == INFERNO_FRAME_RESIZE) {
+            g_free(buf);
+            size = (size_t)info.width * info.height * 4;
+            buf  = g_malloc0(size);
+        }
+        g_usleep(1000000 / 60);
+        if (qemu_clock_get_ms(QEMU_CLOCK_REALTIME) < next) { continue; }
+        next += 1000;
+        second++;
+        inferno_display_stats(&stats);
+        inferno_display_gaps(&gmin, &gmean, &gmax);
+        fprintf(stderr,
+                "INFERNO-FPS %" PRIu64 " presents=%" PRIu64 " refreshes=%" PRIu64 " gap=%" PRId64 "/%" PRId64 "/%"
+                PRId64 "ms\n",
+                second, stats.presents, stats.refreshes, gmin, gmean, gmax);
+        fflush(stderr);
+    }
+    return NULL;
+}
+
+static void inferno_headless_start(Notifier* n, void* opaque)
+{
+    static QemuThread thread;
+
+    if (g_strcmp0(getenv("INFERNO_HEADLESS_FPS"), "1") != 0) { return; }
+
+    inferno_display_attach();
+    qemu_thread_create(&thread, "inferno.fps", inferno_headless_pump, NULL, QEMU_THREAD_DETACHED);
+}
+
+static Notifier inferno_headless_notifier = {.notify = inferno_headless_start};
+
+static void __attribute__((constructor)) inferno_headless_register(void)
+{ qemu_add_machine_init_done_notifier(&inferno_headless_notifier); }
