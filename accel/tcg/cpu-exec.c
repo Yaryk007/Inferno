@@ -116,6 +116,15 @@ static TranslationBlock* tb_htable_lookup(CPUState* cpu, TCGTBCPUState s)
     return qht_lookup_custom(&tb_ctx.htable, &desc, h, tb_lookup_cmp);
 }
 
+/* Newest in the first way, what was there pushed down to the second. */
+static inline void tb_jmp_cache_insert(CPUJumpCache* jc, uint32_t set, vaddr pc, TranslationBlock* tb)
+{
+    jc->array[set + 1].pc = jc->array[set].pc;
+    qatomic_set(&jc->array[set + 1].tb, qatomic_read(&jc->array[set].tb));
+    jc->array[set].pc = pc;
+    qatomic_set(&jc->array[set].tb, tb);
+}
+
 /**
  * tb_lookup:
  * @cpu: CPU that will execute the returned translation block
@@ -149,11 +158,18 @@ static inline TranslationBlock* tb_lookup(CPUState* cpu, TCGTBCPUState s)
         goto hit;
     }
 
+    /* The other way of the set, in the same line of the host's cache. */
+    tb = qatomic_read(&jc->array[hash + 1].tb);
+    if (tb && jc->array[hash + 1].pc == s.pc && tb->cs_base == s.cs_base && tb->flags == s.flags
+        && tb_cflags(tb) == s.cflags)
+    {
+        goto hit;
+    }
+
     tb = tb_htable_lookup(cpu, s);
     if (tb == NULL) { return NULL; }
 
-    jc->array[hash].pc = s.pc;
-    qatomic_set(&jc->array[hash].tb, tb);
+    tb_jmp_cache_insert(jc, hash, s.pc, tb);
 
 hit:
     /*
@@ -730,10 +746,9 @@ static int __attribute__((noinline)) cpu_exec_loop(CPUState* cpu, SyncClocks* sc
                  * We add the TB in the virtual pc hash table
                  * for the fast lookup
                  */
-                h               = tb_jmp_cache_hash_func(s.pc);
-                jc              = cpu->tb_jmp_cache;
-                jc->array[h].pc = s.pc;
-                qatomic_set(&jc->array[h].tb, tb);
+                h  = tb_jmp_cache_hash_func(s.pc);
+                jc = cpu->tb_jmp_cache;
+                tb_jmp_cache_insert(jc, h, s.pc, tb);
             }
 
             /*

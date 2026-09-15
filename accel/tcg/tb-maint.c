@@ -745,11 +745,14 @@ static void tb_jmp_cache_inval_tb(TranslationBlock* tb)
     }
     else {
         uint32_t h = tb_jmp_cache_hash_func(tb->pc);
+        int      w;
 
         CPU_FOREACH (cpu) {
             CPUJumpCache* jc = cpu->tb_jmp_cache;
 
-            if (qatomic_read(&jc->array[h].tb) == tb) { qatomic_set(&jc->array[h].tb, NULL); }
+            for (w = 0; w < TB_JMP_CACHE_WAYS; w++) {
+                if (qatomic_read(&jc->array[h + w].tb) == tb) { qatomic_set(&jc->array[h + w].tb, NULL); }
+            }
         }
     }
 }

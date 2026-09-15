@@ -42,18 +42,25 @@ static inline unsigned int tb_jmp_cache_hash_page(vaddr pc)
     return (tmp >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS)) & TB_JMP_PAGE_MASK;
 }
 
+/*
+ * The index of a set, not of an entry: the cache is two-way, and the two
+ * entries of a set sit side by side so that both are in one line of the host's
+ * cache. The set is picked from one bit less of the offset than the entry used
+ * to be, which is what makes room for the second way.
+ */
 static inline unsigned int tb_jmp_cache_hash_func(vaddr pc)
 {
     vaddr tmp;
     tmp = pc ^ (pc >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS));
-    return (((tmp >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS)) & TB_JMP_PAGE_MASK) | (tmp & TB_JMP_ADDR_MASK));
+    return (((tmp >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS)) & TB_JMP_PAGE_MASK)
+            | ((tmp & (TB_JMP_ADDR_MASK >> 1)) * TB_JMP_CACHE_WAYS));
 }
 
 #else
 
 /* In user-mode we can get better hashing because we do not have a TLB */
 static inline unsigned int tb_jmp_cache_hash_func(vaddr pc)
-{ return (pc ^ (pc >> TB_JMP_CACHE_BITS)) & (TB_JMP_CACHE_SIZE - 1); }
+{ return ((pc ^ (pc >> TB_JMP_CACHE_BITS)) & (TB_JMP_CACHE_SIZE - 1)) & ~(TB_JMP_CACHE_WAYS - 1); }
 
 #endif /* CONFIG_SOFTMMU */
 
