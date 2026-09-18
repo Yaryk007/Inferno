@@ -237,6 +237,29 @@ static void ck_kp_apfs_patches(CKPatcherRange* range)
     };
     ck_patcher_find_callback(range, "bypass root hash authentication", root_hash_pattern, NULL,
                              sizeof(root_hash_pattern), sizeof(uint32_t), ck_kp_root_hash_callback);
+
+    // apfs_vfsop_mount panics ("Rooting from the live fs of a sealed volume is not allowed on a
+    // RELEASE build") when it cannot find the named root snapshot and the volume is sealed. We boot
+    // the restored system straight from -kernel, without the iBoot manifest that names the snapshot,
+    // so the search fails and a freshly sealed volume hits the panic. Let it root from the live fs
+    // the way a development kernel would, by dropping the `tbnz w8, #5` on the sealed flag (bit 5 of
+    // the fs flags byte at +0x38); the unique trailing `str xzr, [sp, #?]` keeps this off the
+    // similar `tbnz w8, #5` in the root-authentication check above.
+    static const uint8_t live_sealed_pattern[] = {
+        0x08, 0xE1, 0x40, 0x39,    // ldrb w8, [x8, #0x38]
+        0x08, 0x00, 0x28, 0x37,    // tbnz w8, #5, #?  (sealed -> panic)
+        0xFF, 0x03, 0x00, 0xF9,    // str xzr, [sp, #?]
+    };
+    static const uint8_t live_sealed_mask[] = {
+        0xFF, 0xFF, 0xFF, 0xFF,    //
+        0x1F, 0x00, 0xF8, 0xFF,    // ignore the tbnz displacement
+        0xFF, 0x03, 0xC0, 0xFF,    // ignore the store offset
+    };
+    QEMU_BUILD_BUG_ON(sizeof(live_sealed_pattern) != sizeof(live_sealed_mask));
+    static const uint8_t live_sealed_repl[] = {NOP_BYTES};
+    ck_patcher_find_replace(range, "allow rooting the live fs of a sealed volume", live_sealed_pattern,
+                            live_sealed_mask, sizeof(live_sealed_pattern), sizeof(uint32_t), live_sealed_repl, NULL, 4,
+                            sizeof(live_sealed_repl));
 }
 
 static bool ck_kp_tc_callback(void* ctx, uint8_t* buffer)
@@ -647,21 +670,29 @@ static void ck_kp_cs_patches(CKPatcherRange* range)
     }
 }
 
+static bool ck_kp_pmap_cs_enforce_callback(void* ctx, uint8_t* buffer)
+{
+    // buffer -> `mov x8, #-0x31d`, the error path in pmap_enter_options_internal after the
+    // pmap_cs verdict check. On 16.3.1 the gating `bl pmap_cs_enforce` and `cbnz w0` are no
+    // longer adjacent to it (extra insns interleave), so anchor on the unique error immediate
+    // and walk back to neuter both. Tolerates the interleave that broke the old find_replace.
+    void* cbnz = ck_patcher_find_prev_insn(buffer, 4, 0x35000000, 0xFF00001F, 0);    // cbnz w0, #?
+    if (cbnz == NULL) { return false; }
+    void* bl = ck_patcher_find_prev_insn(cbnz, 4, 0x94000000, 0xFC000000, 0);        // bl #?
+    if (bl == NULL) { return false; }
+    stl_le_p(bl, MOV_W0_0);    // pmap_cs_enforce() -> 0 (allowed)
+    stl_le_p(cbnz, NOP);       // never branch to the CS violation handler
+    return true;
+}
+
 static void ck_kp_pmap_cs_enforce_patch(CKPatcherRange* range)
 {
     // in pmap_enter_options_internal
     static const uint8_t pattern[] = {
-        0x00, 0x00, 0x00, 0x94,    // bl #?
-        0x00, 0x00, 0x00, 0x35,    // cbnz w0, #?
         0x88, 0x63, 0x80, 0x92,    // mov x8, #0xfffffffffffffce3
     };
-    static const uint8_t mask[] = {
-        0x00, 0x00, 0x00, 0xFC, 0x1F, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    };
-    QEMU_BUILD_BUG_ON(sizeof(pattern) != sizeof(mask));
-    static const uint8_t repl[] = {MOV_W0_0_BYTES, NOP_BYTES};
-    ck_patcher_find_replace(range, "bypass pmap_cs_enforce", pattern, mask, sizeof(pattern), sizeof(uint32_t), repl,
-                            NULL, 0, sizeof(repl));
+    ck_patcher_find_callback(range, "bypass pmap_cs_enforce", pattern, NULL, sizeof(pattern), sizeof(uint32_t),
+                             ck_kp_pmap_cs_enforce_callback);
 }
 
 void ck_patch_kernel(MachoHeader64* hdr)
@@ -709,6 +740,9 @@ void ck_patch_kernel(MachoHeader64* hdr)
     else {
         ck_kp_tc_patch(kernel_ppltext);
         ck_kp_pmap_cs_enforce_patch(kernel_ppltext);
+        // On 16.3.1 pmap_enter_options_internal (and its pmap_cs verdict check) lives in
+        // __TEXT_EXEC, not __PPLTEXT; the anchor is unique so this is a no-op elsewhere.
+        ck_kp_pmap_cs_enforce_patch(kernel_text);
     }
 }
 
