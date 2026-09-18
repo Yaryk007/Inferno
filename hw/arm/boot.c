@@ -108,7 +108,7 @@ static const char* KEEP_COMP[] = {
     "sart,coastguard\0$",
     "sart,t8030\0$",
     "sacm,1\0$",
-    // "scaler,t8030\0scaler,s5l8960x\0$",
+    "scaler,t8030\0scaler,s5l8960x\0$",
     "sio-dma-controller\0$",
     "smc-pmu\0$",
     "smc-tempsensor\0$",
@@ -709,7 +709,7 @@ void apple_boot_finalise_dt(AppleDTNode* root, AddressSpace* as, AppleBootInfo* 
         }
     }
 
-    buf = g_malloc(info->device_tree_size);
+    buf = g_malloc0(info->device_tree_size);
     apple_dt_serialise(root, buf);
 
     address_space_rw(as, info->device_tree_addr, MEMTXATTRS_UNSPECIFIED, buf, info->device_tree_size, true);
@@ -1132,7 +1132,7 @@ static void apple_boot_process_symbols(MachoHeader64* header, uint64_t slide)
     vaddr                  kernel_low;
     vaddr                  kernel_high;
     uint32_t               index;
-    void*                  base;
+    uint8_t*               base;
     MachoSegmentCommand64* linkedit_seg;
     MachoNList64*          sym;
     uint32_t               off;
@@ -1218,7 +1218,7 @@ vaddr apple_boot_load_macho(MachoHeader64* header, AddressSpace* as, AppleDTNode
     vaddr          kc_end;
     bool           is_fileset = header->file_type == MH_FILESET;
     MachoHeader64* header2    = NULL;
-    void*          load_from2 = NULL;
+    uint8_t*       load_from2 = NULL;
 
     apple_boot_get_kc_bounds(header, NULL, &kc_base, &kc_end, NULL, NULL);
 
@@ -1256,9 +1256,9 @@ vaddr apple_boot_load_macho(MachoHeader64* header, AddressSpace* as, AppleDTNode
                          sp = apple_boot_next_sect(sp))
                     {
                         if ((sp->flags & SECTION_TYPE) == S_NON_LAZY_SYMBOL_POINTERS) {
-                            load_from2 = (void*)(data + sp->addr - kc_base);
+                            load_from2 = (uint8_t*)(data + sp->addr - kc_base);
                             void** nl_symbol_ptr;
-                            for (nl_symbol_ptr = load_from2; nl_symbol_ptr < (void**)(load_from2 + sp->size);
+                            for (nl_symbol_ptr = (void**)load_from2; nl_symbol_ptr < (void**)(load_from2 + sp->size);
                                  nl_symbol_ptr++)
                             {
                                 *nl_symbol_ptr += virt_slide;
@@ -1320,9 +1320,9 @@ vaddr apple_boot_load_macho(MachoHeader64* header, AddressSpace* as, AppleDTNode
                          sp = apple_boot_next_sect(sp))
                     {
                         if ((sp->flags & SECTION_TYPE) == S_NON_LAZY_SYMBOL_POINTERS) {
-                            load_from2 = (void*)(data + sp->addr - kc_base);
+                            load_from2 = (uint8_t*)(data + sp->addr - kc_base);
                             void** nl_symbol_ptr;
-                            for (nl_symbol_ptr = load_from2; nl_symbol_ptr < (void**)(load_from2 + sp->size);
+                            for (nl_symbol_ptr = (void**)load_from2; nl_symbol_ptr < (void**)(load_from2 + sp->size);
                                  nl_symbol_ptr++)
                             {
                                 *nl_symbol_ptr -= virt_slide;

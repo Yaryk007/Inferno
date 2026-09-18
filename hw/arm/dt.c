@@ -232,10 +232,12 @@ AppleDTProp* apple_dt_set_prop_str(AppleDTNode* node, const char* name, const ch
 
 AppleDTProp* apple_dt_set_prop_strn(AppleDTNode* node, const char* name, uint32_t max_len, const char* val)
 {
-    g_autofree char* buf;
+    g_autofree char* buf = NULL;
 
-    buf = g_malloc(max_len);
-    strncpy(buf, val, max_len);
+    assert_cmpint(max_len, >, 0);
+
+    buf = g_malloc0(max_len);
+    strncpy(buf, val, max_len - 1);
     return apple_dt_set_prop(node, name, max_len, buf);
 }
 
@@ -423,7 +425,7 @@ static uint32_t apple_dt_prop_placeholder_len(AppleDTProp* prop)
 
     if (prop->len == 0) { return 0; }
 
-    next = string = g_new0(char, prop->len);
+    next = string = g_new0(char, prop->len + 1);
     memcpy(next, prop->data, prop->len);
 
     while ((token = qemu_strsep(&next, ",")) != NULL) {
@@ -462,6 +464,7 @@ static void apple_dt_serialise_node(AppleDTNode* node, void** buf)
     gpointer       key;
     AppleDTProp*   prop;
     uint32_t       placeholder_len;
+    uint32_t       padded;
 
     assert_true(node->finalised);
 
@@ -487,9 +490,10 @@ static void apple_dt_serialise_node(AppleDTNode* node, void** buf)
             strncpy(*buf, key, APPLE_DT_PROP_NAME_LEN);
             *buf += APPLE_DT_PROP_NAME_LEN;
             stl_le_p(*buf, placeholder_len);
-            *buf += sizeof(uint32_t);
-            memset(*buf, 0, placeholder_len);
-            *buf += ROUND_UP(placeholder_len, 4);
+            *buf   += sizeof(uint32_t);
+            padded  = ROUND_UP(placeholder_len, 4);
+            memset(*buf, 0, padded);
+            *buf += padded;
         }
         else {
             strncpy(*buf, key, APPLE_DT_PROP_NAME_LEN);
@@ -498,8 +502,10 @@ static void apple_dt_serialise_node(AppleDTNode* node, void** buf)
             *buf += sizeof(uint32_t);
 
             if (prop->len != 0) {
+                padded = ROUND_UP(prop->len, 4);
                 memcpy(*buf, prop->data, prop->len);
-                *buf += ROUND_UP(prop->len, 4);
+                memset(*buf + prop->len, 0, padded - prop->len);
+                *buf += padded;
             }
         }
         prop_count += 1;

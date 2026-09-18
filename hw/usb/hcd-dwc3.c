@@ -100,14 +100,18 @@ static int dwc3_packet_find_epid(DWC3State* s, USBPacket* p)
     return -1;
 }
 
+static int dwc3_device_intr_level(DWC3State* s, int n)
+{
+    if (s->gevntsiz(n) & GEVNTSIZ_EVNTINTRPTMASK) { return 0; }
+    return qatomic_read(&s->intrs[n].count) > 0;
+}
+
 static void dwc3_update_irq(DWC3State* s)
 {
     int ip = 0;
     for (uint32_t i = 0; i < s->numintrs; i++) {
-        int level  = 1;
-        level     &= !(s->gevntsiz(i) & GEVNTSIZ_EVNTINTRPTMASK);
-        level     &= (s->intrs[i].count > 0);
-        qemu_set_irq(s->sysbus_xhci.irq[i], level);
+        int level = dwc3_device_intr_level(s, i);
+        qemu_set_irq(s->sysbus_xhci.irq[i], level || s->host_intr_state[i]);
         ip |= level;
     }
     if (ip) { s->gsts |= GSTS_DEVICE_IP; }
@@ -133,7 +137,7 @@ static bool dwc3_host_intr_raise(XHCIState* xhci, int n, bool level)
     else {
         s->gsts &= ~GSTS_HOST_IP;
     }
-    qemu_set_irq(xhci_sysbus->irq[n], level);
+    qemu_set_irq(xhci_sysbus->irq[n], level || dwc3_device_intr_level(s, n));
 
     return false;
 }
@@ -336,15 +340,13 @@ static bool dwc3_bd_writeback(DWC3State* s, DWC3BufferDesc* desc, USBPacket* p, 
                     __func__, p->pid, desc->epid, desc->actual_length, length, trb->size,
                     TRBControlType_names[setup_ep->last_control_command]);
             setup_ep->last_control_command = TRBCTL_CONTROL_SETUP;
-            assert_cmpuint(desc->epid, ==, 0x0);
-            if (desc->actual_length != 0x8) {
+            if ((desc->epid & 1) != 0 || desc->actual_length != 0x8) {
                 // maybe return true in this case, or let process_packet handle
                 // this as well. unsure which status to return. this assert got
                 // hit, because of further dwc3_process_packet xfer==NULL
                 // handling when setting ASYNC. assert_not_reached();
                 qemu_log_mask(LOG_GUEST_ERROR,
-                              "%s: TRBCTL_CONTROL_SETUP: desc->actual_length != 0x8 edge "
-                              "case got hit: p->pid: 0x%x desc->epid: 0x%x "
+                              "%s: TRBCTL_CONTROL_SETUP: bad setup stage: p->pid: 0x%x desc->epid: 0x%x "
                               "desc->actual_length 0x%x length 0x%x trb->size 0x%x\n",
                               __func__, p->pid, desc->epid, desc->actual_length, length, trb->size);
                 event.endpoint_event  = DEPEVT_XFERNOTREADY;
@@ -373,8 +375,10 @@ static bool dwc3_bd_writeback(DWC3State* s, DWC3BufferDesc* desc, USBPacket* p, 
                     "== 0x%x\n",
                     __func__, setup_ep->setup_packet.wLength, usb_packet_size(p), desc->actual_length);
             setup_ep->last_control_command = TRBCTL_CONTROL_DATA;
-            assert(p->pid == USB_TOKEN_IN || p->pid == USB_TOKEN_OUT);
-            assert_cmpuint(setup_ep->setup_packet.wLength, !=, 0x0);
+            if ((p->pid != USB_TOKEN_IN && p->pid != USB_TOKEN_OUT) || setup_ep->setup_packet.wLength == 0x0) {
+                qemu_log_mask(LOG_GUEST_ERROR, "%s: TRBCTL_CONTROL_DATA: pid 0x%x wLength 0x%x on ep %d\n", __func__,
+                              p->pid, setup_ep->setup_packet.wLength, desc->epid);
+            }
             // only do a xfercomplete here if returning here
             if (usb_packet_size(p) > setup_ep->setup_packet.wLength
                 || usb_packet_size(p) == 0x0 /* || desc->actual_length == 0*/)
@@ -453,8 +457,9 @@ static bool dwc3_bd_writeback(DWC3State* s, DWC3BufferDesc* desc, USBPacket* p, 
                     bool ioc = trb->ctrl & TRB_CTRL_IOC;
                     bool isp = trb->ctrl & TRB_CTRL_ISP_IMI;
                     switch (trb->ctrl & (TRB_CTRL_CHN | TRB_CTRL_LST)) {
-                        case TRB_CTRL_LST: goto short_complete;
-                        case TRB_CTRL_CHN: {
+                        case TRB_CTRL_CHN | TRB_CTRL_LST:
+                        case TRB_CTRL_LST               : goto short_complete;
+                        case TRB_CTRL_CHN               : {
                             for (j = 0; j < desc->count; j++) {
                                 ioc |= (desc->trbs[j].ctrl & TRB_CTRL_IOC) != 0;
                                 isp |= (desc->trbs[j].ctrl & TRB_CTRL_ISP_IMI) != 0;
@@ -735,13 +740,20 @@ static void dwc3_td_fetch(DWC3State* s, DWC3Transfer* xfer, dma_addr_t tdaddr)
         do {
             if (dma_memory_read(desc->sgl.as, tdaddr, &trb, sizeof(trb), MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
                 qemu_log_mask(LOG_GUEST_ERROR, "%s: failed to read trb\n", __func__);
-                return;
+                ended = true;
+                break;
             }
             uint32_t controlType = TRB_CTRL_TRBCTL(trb.ctrl);
             // everything but reserved and isochronous*
-            assert(controlType == TRBCTL_NORMAL || controlType == TRBCTL_CONTROL_SETUP
-                   || controlType == TRBCTL_CONTROL_STATUS2 || controlType == TRBCTL_CONTROL_STATUS3
-                   || controlType == TRBCTL_CONTROL_DATA || controlType == TRBCTL_LINK_TRB);
+            if (!(controlType == TRBCTL_NORMAL || controlType == TRBCTL_CONTROL_SETUP
+                  || controlType == TRBCTL_CONTROL_STATUS2 || controlType == TRBCTL_CONTROL_STATUS3
+                  || controlType == TRBCTL_CONTROL_DATA || controlType == TRBCTL_LINK_TRB))
+            {
+                qemu_log_mask(LOG_GUEST_ERROR, "%s: unsupported TRBCTL %d at 0x%" HWADDR_PRIx "\n", __func__,
+                              controlType, tdaddr);
+                ended = true;
+                break;
+            }
             DPRINTF("%s: tdaddr 0x%" HWADDR_PRIx " controlType: %d trb.ctrl: 0x%x\n", __func__, tdaddr, controlType,
                     trb.ctrl);
 
@@ -794,14 +806,18 @@ static void dwc3_td_fetch(DWC3State* s, DWC3Transfer* xfer, dma_addr_t tdaddr)
             tdaddr += sizeof(trb);
 
             if (trb.ctrl & TRB_CTRL_LST) {
-                xfer->can_free  = true;
-                trb.ctrl       &= ~TRB_CTRL_CHN;
-                ended           = true;
+                xfer->can_free = true;
+                ended          = true;
                 DPRINTF("%s: ended;break: (trb.ctrl & TRB_CTRL_LST)\n", __func__);
                 break;
             }
         }
         while (!ended);
+        if (desc->count == 0) {
+            dwc3_bd_free(s, desc);
+            ended = true;
+            break;
+        }
         QTAILQ_INSERT_TAIL(&xfer->buffers, desc, queue);
         xfer->count++;
     }
@@ -851,11 +867,14 @@ static void dwc3_write_event(DWC3State* s, union dwc3_event event, uint32_t v)
     DWC3EventRing* intr = &s->intrs[v];
     dma_addr_t     ring_base;
     dma_addr_t     ev_addr;
+    uint32_t       head;
 
     ring_base = dwc3_addr64(s->gevntadr_lo(v), s->gevntadr_hi(v));
-    intr      = &s->intrs[v];
 
-    ev_addr = ring_base + qatomic_fetch_add(&intr->head, EVENT_SIZE) % intr->size;
+    head    = qatomic_read(&intr->head);
+    ev_addr = ring_base + head;
+    qatomic_set(&intr->head, (head + EVENT_SIZE) % intr->size);
+
     dma_memory_write(&s->dma_as, ev_addr, &event.raw, EVENT_SIZE, MEMTXATTRS_UNSPECIFIED);
     smp_wmb();
     qatomic_add(&intr->count, EVENT_SIZE);
@@ -865,6 +884,7 @@ static void dwc3_write_event(DWC3State* s, union dwc3_event event, uint32_t v)
 static void dwc3_event(DWC3State* s, union dwc3_event event, uint32_t v)
 {
     DWC3EventRing* intr;
+    uint32_t       count;
 
     if (v >= s->numintrs) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: ring nr out of range (%u >= %u)\n", __func__, v, s->numintrs);
@@ -872,34 +892,40 @@ static void dwc3_event(DWC3State* s, union dwc3_event event, uint32_t v)
     }
     intr = &s->intrs[v];
 
-    if (intr->count + 1 >= intr->size) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "%s: ring nr %u is full. "
-                      "Dropping event.\n",
-                      __func__, v);
+    if (intr->size < 2 * EVENT_SIZE) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: ring nr %u is not configured (size 0x%x). Dropping event.\n", __func__, v,
+                      intr->size);
         return;
     }
-    else if (intr->count + 2 == intr->size) {
-        union dwc3_event overflow = {.devt = {1, 0, DEVICE_EVENT_OVERFLOW}};
-        if (event.raw != overflow.raw) {
-            dwc3_device_event(s, overflow.devt);
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "%s: ring nr %u is full."
-                          "Sending event overflow.\n",
-                          __func__, v);
-        }
-    }
+
+    count = qatomic_read(&intr->count);
+
+    if (count + EVENT_SIZE <= intr->size - EVENT_SIZE) { dwc3_write_event(s, event, v); }
     else {
-        dwc3_write_event(s, event, v);
+        union dwc3_event overflow = {.devt = {1, 0, DEVICE_EVENT_OVERFLOW}};
+
+        if (count + EVENT_SIZE <= intr->size && event.raw != overflow.raw) {
+            dwc3_write_event(s, overflow, v);
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: ring nr %u is full. Sending event overflow.\n", __func__, v);
+        }
+        else {
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: ring nr %u is full. Dropping event.\n", __func__, v);
+        }
     }
     dwc3_update_irq(s);
 }
 
-static void dwc3_device_event(DWC3State* s, struct dwc3_event_devt devt)
+static void dwc3_device_event_ungated(DWC3State* s, struct dwc3_event_devt devt)
 {
     union dwc3_event event = {.devt = devt};
-    int              v     = DCFG_INTRNUM_GET(s->dcfg);
-    if (s->devten & (1 << (devt.type))) { dwc3_event(s, event, v); }
+
+    dwc3_event(s, event, DCFG_INTRNUM_GET(s->dcfg));
+}
+
+static void dwc3_device_event(DWC3State* s, struct dwc3_event_devt devt)
+{
+    if (!(s->devten & (1 << (devt.type)))) { return; }
+    dwc3_device_event_ungated(s, devt);
 }
 
 static void dwc3_ep_event(DWC3State* s, int epid, struct dwc3_event_depevt depevt)
@@ -935,7 +961,7 @@ static void dwc3_ep_trb_event(DWC3State* s, int epid, DWC3TRB* trb, struct dwc3_
     dwc3_ep_event(s, epid, depevt);
 }
 
-static void dwc3_dcore_reset(DWC3State* s)
+static void dwc3_dcore_reset(DWC3State* s, bool soft)
 {
     USBDevice* udev = &s->device.parent_obj;
 
@@ -951,30 +977,32 @@ static void dwc3_dcore_reset(DWC3State* s)
     s->gsbuscfg1 = (0xf << 8);
     s->gtxthrcfg = 0;
     s->grxthrcfg = 0;
-    s->gctl      = GCTL_PWRDNSCALE(0x4b0) | GCTL_PRTCAPDIR(GCTL_PRTCAP_DEVICE) | GCTL_U2RSTECN | GCTL_U2EXIT_LFPS;
-    s->guctl     = (1 << 15) | (0x10 << 0);
+    if (!soft) {
+        s->gctl   = GCTL_PWRDNSCALE(0x4b0) | GCTL_PRTCAPDIR(GCTL_PRTCAP_DEVICE) | GCTL_U2RSTECN | GCTL_U2EXIT_LFPS;
+        s->guctl  = (1 << 15) | (0x10 << 0);
+        s->gsts  &= ~GSTS_BUS_ERR_ADDR_VLD;
+    }
     // usb_dwc3_glbreg_write: default: addr: 0xc11c val: 0x80400000
-    s->guctl1           = 0;
-    s->gevten           = 0;
-    s->gbuserraddrlo    = 0;
-    s->gbuserraddrhi    = 0;
-    s->gsts            &= ~GSTS_BUS_ERR_ADDR_VLD;
-    s->gprtbimaplo      = 0;
-    s->gprtbimaphi      = 0;
-    s->gprtbimap_hs_lo  = 0;
-    s->gprtbimap_hs_hi  = 0;
-    s->gprtbimap_fs_lo  = 0;
-    s->gprtbimap_fs_hi  = 0;
-    s->ghwparams0       = 0x40204048 | (GHWPARAMS0_MODE_DRD);
-    s->ghwparams1       = 0x222493b;
-    s->ghwparams2       = 0x12345678;
-    s->ghwparams3       = (0x20 << 23) | GHWPARAMS3_NUM_IN_EPS(DWC3_NUM_EPS >> 1) | GHWPARAMS3_NUM_EPS(DWC3_NUM_EPS)
-                          | (0x2 << 6) | (0x3 << 2) | (0x1 << 0);
-    s->ghwparams4       = 0x47822004;
-    s->ghwparams5       = 0x4202088;
-    s->ghwparams6       = 0x7850c20;
-    s->ghwparams7       = 0x0;
-    s->ghwparams8       = 0x478;
+    s->guctl1          = 0;
+    s->gevten          = 0;
+    s->gbuserraddrlo   = 0;
+    s->gbuserraddrhi   = 0;
+    s->gprtbimaplo     = 0;
+    s->gprtbimaphi     = 0;
+    s->gprtbimap_hs_lo = 0;
+    s->gprtbimap_hs_hi = 0;
+    s->gprtbimap_fs_lo = 0;
+    s->gprtbimap_fs_hi = 0;
+    s->ghwparams0      = 0x40204048 | (GHWPARAMS0_MODE_DRD);
+    s->ghwparams1      = 0x222493b;
+    s->ghwparams2      = 0x12345678;
+    s->ghwparams3      = (0x20 << 23) | GHWPARAMS3_NUM_IN_EPS(DWC3_NUM_EPS >> 1) | GHWPARAMS3_NUM_EPS(DWC3_NUM_EPS)
+                         | (0x2 << 6) | (0x3 << 2) | (0x1 << 0);
+    s->ghwparams4      = 0x47822004;
+    s->ghwparams5      = 0x4202088;
+    s->ghwparams6      = 0x7850c20;
+    s->ghwparams7      = 0x0;
+    s->ghwparams8      = 0x478;
     memset(s->gtxfifosiz, 0, sizeof(s->gtxfifosiz));
     memset(s->grxfifosiz, 0, sizeof(s->grxfifosiz));
     memset(s->gevntregs, 0, sizeof(s->gevntregs));
@@ -1022,7 +1050,7 @@ static void dwc3_reset_enter(Object* obj, ResetType type)
 {
     DWC3State* s = DWC3_USB(obj);
 
-    dwc3_dcore_reset(s);
+    dwc3_dcore_reset(s, false);
     s->gsts    = GSTS_CURMOD_DRD;
     s->gsnpsid = GSNPSID_REVISION_180A;
     s->ggpio   = 0;
@@ -1266,20 +1294,6 @@ static uint64_t usb_dwc3_dreg_read(void* opaque, hwaddr addr, int index)
     mmio = &s->dreg[index];
     val  = *mmio;
 
-    switch (addr) {
-        case DCTL:
-            /* Self-clearing bits */
-            val   &= ~(DCTL_CSFTRST);
-            *mmio  = val;
-            break;
-        case DGCMD:
-            /* Self-clearing bits */
-            val   &= ~(DGCMD_CMDACT);
-            *mmio  = val;
-            break;
-        default: break;
-    }
-
     return val;
 }
 
@@ -1309,8 +1323,8 @@ static void usb_dwc3_dreg_write(void* opaque, hwaddr addr, int index, uint64_t v
             break;
         }
         case DCTL:
-            if (!(old & DCTL_CSFTRST) && (val & DCTL_CSFTRST)) {
-                dwc3_dcore_reset(s);
+            if (val & DCTL_CSFTRST) {
+                dwc3_dcore_reset(s, true);
                 iflg = true;
             }
 
@@ -1325,12 +1339,11 @@ static void usb_dwc3_dreg_write(void* opaque, hwaddr addr, int index, uint64_t v
                 s->dsts |= DSTS_DEVCTRLHLT;
             }
             /* Self clearing bits */
-            val |= old & (DCTL_CSFTRST);
+            val &= ~DCTL_CSFTRST;
             break;
         case DSTS: val = old; break;
         case DGCMD:
-            val &= ~(DGCMD_CMDSTATUS);
-            val |= (old & (DGCMD_CMDSTATUS | DGCMD_CMDACT));
+            val &= ~DGCMD_CMDSTATUS;
             if (!(val & DGCMD_CMDACT)) { break; }
             /* TODO DGCMD */
             switch (DGCMD_CMDTYPE_GET(val)) {
@@ -1357,9 +1370,10 @@ static void usb_dwc3_dreg_write(void* opaque, hwaddr addr, int index, uint64_t v
                     val |= (DGCMD_CMDSTATUS);
                     break;
             }
+            val &= ~DGCMD_CMDACT;
             if (val & DGCMD_CMDIOC) {
                 struct dwc3_event_devt ioc = {1, 0, DEVICE_EVENT_CMD_CMPL};
-                dwc3_device_event(s, ioc);
+                dwc3_device_event_ungated(s, ioc);
             }
             break;
         case DALEPENA:
@@ -1387,36 +1401,34 @@ static uint64_t usb_dwc3_depcmdreg_read(void* opaque, hwaddr addr, int index)
     mmio = &s->depcmdreg[index];
     val  = *mmio;
 
-    switch (DEPCMDPAR2(0) + (addr & 0xc)) {
-        case DEPCMD(0):
-            /* Self-clearing bits */
-            val   &= ~(DEPCMD_CMDACT);
-            *mmio  = val;
-            break;
-        default: break;
-    }
     return val;
 }
 
+#ifdef DEBUG_DWC3
 static const char* DEPCMD_names[] = {
-    [DEPCMD_CFG]          = "DEPCFG",
-    [DEPCMD_XFERCFG]      = "DEPXFERCFG",
-    [DEPCMD_GETSEQNUMBER] = "DEPGETDSEQ",
-    [DEPCMD_GETEPSTATE]   = "DEPGETEPSTATE",
-    [DEPCMD_SETSTALL]     = "DEPSETSTALL",
-    [DEPCMD_CLEARSTALL]   = "DEPCSTALL",
-    [DEPCMD_STARTXFER]    = "DEPSTRTXFER",
-    [DEPCMD_UPDATEXFER]   = "DEPUPDXFER",
-    [DEPCMD_ENDXFER]      = "DEPENDXFER",
-    [DEPCMD_STARTCFG]     = "DEPSTARTCFG",
+    [DEPCMD_CFG]        = "DEPCFG",
+    [DEPCMD_XFERCFG]    = "DEPXFERCFG",
+    [DEPCMD_GETEPSTATE] = "DEPGETEPSTATE",
+    [DEPCMD_SETSTALL]   = "DEPSETSTALL",
+    [DEPCMD_CLEARSTALL] = "DEPCSTALL",
+    [DEPCMD_STARTXFER]  = "DEPSTRTXFER",
+    [DEPCMD_UPDATEXFER] = "DEPUPDXFER",
+    [DEPCMD_ENDXFER]    = "DEPENDXFER",
+    [DEPCMD_STARTCFG]   = "DEPSTARTCFG",
 };
+
+static const char* dwc3_depcmd_name(uint32_t cmd)
+{
+    if (cmd < ARRAY_SIZE(DEPCMD_names) && DEPCMD_names[cmd] != NULL) { return DEPCMD_names[cmd]; }
+    return "<reserved>";
+}
+#endif
 
 static void usb_dwc3_depcmdreg_write(void* opaque, hwaddr addr, int index, uint64_t val)
 {
     DWC3State*    s    = opaque;
     USBDevice*    udev = &s->device.parent_obj;
     uint32_t*     mmio;
-    uint32_t      old;
     int           iflg = 0;
     uint32_t      epid = index >> 2;
     DWC3Endpoint* ep   = &s->eps[epid];
@@ -1428,7 +1440,6 @@ static void usb_dwc3_depcmdreg_write(void* opaque, hwaddr addr, int index, uint6
     }
 
     mmio = &s->depcmdreg[index];
-    old  = *mmio;
 
     switch (DEPCMDPAR2(0) + (addr & 0xc)) {
         case DEPCMD(0): {
@@ -1436,43 +1447,46 @@ static void usb_dwc3_depcmdreg_write(void* opaque, hwaddr addr, int index, uint6
             uint32_t                 par1  = s->depcmdpar1(epid);
             uint32_t G_GNUC_UNUSED   par2  = s->depcmdpar2(epid);
             struct dwc3_event_depevt ioc   = {0, epid, DEPEVT_EPCMDCMPLT, 0, 0, DEPCMD_CMD_GET(val) << 8};
-            val                           &= ~(DEPCMD_STATUS);
-            val                           |= (old & (DEPCMD_CMDACT));
+            val                           &= ~DEPCMD_STATUS_MASK;
             if (!(val & DEPCMD_CMDACT)) {
                 if (!(val & DEPCMD_CMDIOC) && DEPCMD_CMD_GET(val) == DEPCMD_UPDATEXFER) {
 #ifdef DEBUG_DWC3
                     qemu_log_mask(LOG_UNIMP,
                                   "Special no response update?: DEPCMD: %s epid: %d"
                                   " par2: 0x%x par1: 0x%x par0: 0x%x\n",
-                                  DEPCMD_names[DEPCMD_CMD_GET(val)], epid, par2, par1, par0);
+                                  dwc3_depcmd_name(DEPCMD_CMD_GET(val)), epid, par2, par1, par0);
 #endif
-                    /* Special no response update? */
-                    DPRINTF("%s: Special no response update?: tdaddr: 0x%" HWADDR_PRIx "\n", __func__,
-                            ep->xfer->tdaddr);
-                    dwc3_td_fetch(s, ep->xfer, ep->xfer->tdaddr);
-                    ep->not_ready = false;
-                    dwc3_ep_run_schedule_update(s, ep);
+                    if (ep->xfer == NULL) {
+                        qemu_log_mask(LOG_GUEST_ERROR,
+                                      "%s: no-response UPDATEXFER on ep %d without an active transfer\n", __func__,
+                                      epid);
+                    }
+                    else {
+                        DPRINTF("%s: Special no response update?: tdaddr: 0x%" HWADDR_PRIx "\n", __func__,
+                                ep->xfer->tdaddr);
+                        dwc3_td_fetch(s, ep->xfer, ep->xfer->tdaddr);
+                        ep->not_ready = false;
+                        dwc3_ep_run_schedule_update(s, ep);
+                    }
                 }
                 break;
             }
-            (void)DEPCMD_names;
 #ifdef DEBUG_DWC3
             qemu_log_mask(LOG_UNIMP,
                           "DEPCMD: %s epid: %d "
                           "par2: 0x%x par1: 0x%x par0: 0x%x\n",
-                          DEPCMD_names[DEPCMD_CMD_GET(val)], epid, par2, par1, par0);
+                          dwc3_depcmd_name(DEPCMD_CMD_GET(val)), epid, par2, par1, par0);
 #endif
+            ep->not_ready = false;
+
             switch (DEPCMD_CMD_GET(val)) {
                 case DEPCMD_CFG: {
                     int epnum = DEPCFG_EP_NUMBER(par1);
-                    assert_cmpuint(epnum, ==, epid);
-                    if (epid == 0 || epid == 1 || (epnum >> 1) == 0) {
-                        if (epnum != epid) {
-                            val |= DEPCMD_STATUS;
-                            // this will be set below anyway
-                            // ioc.status = 1;
-                            break;
-                        }
+                    if (epnum != (int)epid) {
+                        qemu_log_mask(LOG_GUEST_ERROR, "%s: DEPCFG: USB ep number %d does not match physical ep %d\n",
+                                      __func__, epnum, epid);
+                        val |= DEPCMD_STATUS_SET(DEPEVT_TRANSFER_NO_RESOURCE);
+                        break;
                     }
                     ep->epnum                = epnum;
                     ep->intrnum              = DEPCFG_INT_NUM(par1);
@@ -1505,16 +1519,23 @@ static void usb_dwc3_depcmdreg_write(void* opaque, hwaddr addr, int index, uint6
                 }
                 case DEPCMD_XFERCFG:
                     DPRINTF("%s: DEPCMD_XFERCFG: ep->epid: %d\n", __func__, ep->epid);
-                    ioc.status  = DEPXFERCFG_NUMXFERRES(par0) != 1;
-                    val        |= (ioc.status ? DEPCMD_STATUS : 0);
+                    if (DEPXFERCFG_NUMXFERRES(par0) != 1) { val |= DEPCMD_STATUS_SET(DEPEVT_TRANSFER_NO_RESOURCE); }
                     break;
                 case DEPCMD_GETSEQNUMBER:
                     // case DEPCMD_GETEPSTATE:
                     DPRINTF("%s: DEPCMD_GETSEQNUMBER/DEPCMD_GETEPSTATE: ep->epid: %d\n", __func__, ep->epid);
-                    ioc.parameters = ep->dseqnum & 0xf;
+                    ioc.parameters |= ep->dseqnum & 0xf;
+                    val            &= ~DEPCMD_PARAM_MASK;
+                    val            |= DEPCMD_PARAM(ep->dseqnum & 0xf);
                     break;
                 case DEPCMD_SETSTALL:
                     ep->stalled = true;
+                    if (epid == 0 || epid == 1) {
+                        DWC3Endpoint* pair = &s->eps[epid ^ 1];
+
+                        pair->stalled = true;
+                        dwc3_ep_run_schedule_update(s, pair);
+                    }
                     dwc3_ep_run_schedule_update(s, ep);
                     break;
                 case DEPCMD_CLEARSTALL:
@@ -1522,41 +1543,40 @@ static void usb_dwc3_depcmdreg_write(void* opaque, hwaddr addr, int index, uint6
                         /* Automatically cleared upon SETUP */
                         break;
                     }
-                    ep->stalled   = false;
-                    ep->not_ready = false;
-                    ep->dseqnum   = 0;
+                    ep->stalled = false;
+                    ep->dseqnum = 0;
                     dwc3_ep_run_schedule_update(s, ep);
                     break;
                 case DEPCMD_STARTXFER: {
                     dma_addr_t tdaddr = dwc3_addr64(par1, par0);
-                    assert_cmphex(tdaddr, !=, UINT64_MAX);
-                    if (ep->xfer) {
-                        qemu_log_mask(LOG_GUEST_ERROR, "DEPCMD_STARTXFER: xfer existed\n");
-                        val |= DEPCMD_STATUS;
+                    if ((tdaddr & 0xf) != 0) {
+                        qemu_log_mask(LOG_GUEST_ERROR, "DEPCMD_STARTXFER: misaligned TD address 0x%" HWADDR_PRIx "\n",
+                                      tdaddr);
+                        val |= DEPCMD_STATUS_SET(DEPEVT_TRANSFER_NO_RESOURCE);
                         break;
                     }
                     if (ep->xfer) {
-                        dwc3_td_free(s, ep->xfer);
-                        ep->xfer = NULL;
+                        qemu_log_mask(LOG_GUEST_ERROR, "DEPCMD_STARTXFER: xfer existed\n");
+                        val |= DEPCMD_STATUS_SET(DEPEVT_TRANSFER_NO_RESOURCE);
+                        break;
                     }
                     DPRINTF("%s: DEPCMD_STARTXFER: ep->epid: %d tdaddr: 0x%" HWADDR_PRIx "\n", __func__, ep->epid,
                             tdaddr);
                     ep->xfer = dwc3_xfer_alloc(s, epid, tdaddr);
                     if (!ep->xfer) {
                         qemu_log_mask(LOG_GUEST_ERROR, "DEPCMD_STARTXFER: Cannot alloc xfer\n");
-                        val |= DEPCMD_STATUS;
+                        val |= DEPCMD_STATUS_SET(DEPEVT_TRANSFER_NO_RESOURCE);
                         break;
                     }
                     val            &= ~DEPCMD_PARAM_MASK;
                     val            |= DEPCFG_RSC_IDX(ep->xfer->rsc_idx);
-                    ioc.parameters  = ep->xfer->rsc_idx & 0x7f;
-                    ep->not_ready   = false;
+                    ioc.parameters |= ep->xfer->rsc_idx & 0x7f;
                     dwc3_ep_run_schedule_update(s, ep);
                     break;
                 }
                 case DEPCMD_UPDATEXFER: {
                     if (!ep->xfer || (ep->xfer->rsc_idx) != DEPCFG_RSC_IDX_GET(val)) {
-                        val |= DEPCMD_STATUS;
+                        val |= DEPCMD_STATUS_SET(DEPEVT_TRANSFER_NO_RESOURCE);
                         if (!ep->xfer) {
                             DPRINTF("%s: UPDATEXFER: Unknown rsc_idx: ep->epid: %d "
                                     "!ep->xfer %d ep->xfer->rsc_idx N/A "
@@ -1576,11 +1596,10 @@ static void usb_dwc3_depcmdreg_write(void* opaque, hwaddr addr, int index, uint6
                             ep->xfer->tdaddr);
                     dwc3_td_fetch(s, ep->xfer, ep->xfer->tdaddr);
                     if (ep->xfer->count == 0) {
-                        val |= DEPCMD_STATUS;
+                        val |= DEPCMD_STATUS_SET(DEPEVT_TRANSFER_NO_RESOURCE);
                         qemu_log_mask(LOG_GUEST_ERROR, "UPDATEXFER: empty xfer\n");
                         break;
                     }
-                    ep->not_ready = false;
                     dwc3_ep_run_schedule_update(s, ep);
                     break;
                 }
@@ -1597,7 +1616,7 @@ static void usb_dwc3_depcmdreg_write(void* opaque, hwaddr addr, int index, uint6
                         }
                     }
                     else {
-                        val |= DEPCMD_STATUS;
+                        val |= DEPCMD_STATUS_SET(DEPEVT_TRANSFER_NO_RESOURCE);
                     }
                     break;
                 case DEPCMD_STARTCFG: {
@@ -1612,11 +1631,6 @@ static void usb_dwc3_depcmdreg_write(void* opaque, hwaddr addr, int index, uint6
                                 "ep->xfer->rsc_idx 0x%x DEPCFG_RSC_IDX_GET(val) 0x%x\n",
                                 __func__, ep->epid, !ep->xfer, ep->xfer->rsc_idx, rsc_idx);
                     }
-                    if (rsc_idx != 0 && rsc_idx != 2) {
-                        val |= DEPCMD_STATUS;
-                        qemu_log_mask(LOG_GUEST_ERROR, "DEPCMD_STARTCFG: invalid rsc_idx %d\n", rsc_idx);
-                        break;
-                    }
                     s->global_rsc_idx_counter = rsc_idx;
                     for (int i = 0; i < DWC3_NUM_EPS; i++) { s->eps[i].rsc_idx_counter = s->global_rsc_idx_counter; }
                     break;
@@ -1624,10 +1638,13 @@ static void usb_dwc3_depcmdreg_write(void* opaque, hwaddr addr, int index, uint6
                 default: break;
             }
 
+            val &= ~DEPCMD_CMDACT;
+
             if (val & DEPCMD_CMDIOC) {
-                if ((val & DEPCMD_STATUS) && (ioc.status == 0)) { ioc.status = 1; }
+                ioc.status = DEPCMD_STATUS_GET(val);
                 dwc3_ep_event(s, epid, ioc);
             }
+            break;
         }
         default: break;
     }
@@ -1711,6 +1728,7 @@ static void usb_dwc3_realize(DeviceState* dev, Error** errp)
         error_propagate(errp, err);
         return;
     }
+    QEMU_BUILD_BUG_ON(DWC3_NUM_INTRS < XHCI_MAXINTRS);
     s->numintrs = s->sysbus_xhci.xhci.numintrs;
 
     memory_region_add_subregion(&s->iomem, 0, sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->sysbus_xhci), 0));
@@ -1906,7 +1924,7 @@ static void dwc3_usb_device_realize(USBDevice* dev, Error** errp)
 {
     // if you use _SUPER here, you'll run into this "Invalid ep0 maxpacket: 9"
     // not sure if I can or even should use a workaround like the one found in
-    // host-libusb having _HIGH here while having _SUPER in dev-tcp-remote
+    // host-libusb having _HIGH here while having _SUPER in dev-inferno-remote
     // causes "Warning: speed mismatch ...", followed by an abort in the
     // companion
     dev->speed        = USB_SPEED_HIGH;
@@ -2047,16 +2065,15 @@ static void dwc3_ep_run(DWC3State* s, DWC3Endpoint* ep)
     assert(bql_locked());
     QEMU_LOCK_GUARD(&s->lock);
 
-    assert_cmpuint(ep->epid, ==, ep->epnum);
-
     if (!ep->uep) {
         DPRINTF("%s: !ep->uep\n", __func__);
         return;
     }
 
-    // still have to test whether the _first or _foreach variant is better
-    // this means both, correctness and speed. everywhere it's used
-    QTAILQ_FOREACH (p, &ep->uep->queue, queue) {
+    assert_cmpuint(ep->epid, ==, ep->epnum);
+
+    p = QTAILQ_FIRST(&ep->uep->queue);
+    if (p != NULL) {
         DPRINTF("%s: pid: 0x%x ep: %d epid: %d id: 0x%" PRIx64 "\n", __func__, p->pid, p->ep->nr, ep->epid, p->id);
         dwc3_process_packet(s, ep, p);
     }

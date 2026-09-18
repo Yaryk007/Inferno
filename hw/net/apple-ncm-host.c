@@ -38,7 +38,11 @@
 #include <limits.h>
 #include "hw/qdev-properties.h"
 #include "hw/usb.h"
-#include "hw/usb/tcp-usb.h"
+#include "hw/usb/inferno-proto.h"
+
+/* This end binds the socket, so it wants a path, not the uplink's socket
+ * address string. */
+#define NCM_HOST_UNIX_DEFAULT "/tmp/InfernoNCMHost"
 #include "net/net.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
@@ -238,8 +242,8 @@ static bool socket_readable(int fd, int timeout_ms)
 static bool usb_write_request(AppleNCMHostState* s, int pid, uint8_t ep, const void* out, uint16_t out_len,
                               uint16_t in_len, uint64_t id)
 {
-    tcp_usb_header_t       header = {.type = TCP_USB_REQUEST};
-    tcp_usb_request_header request = {0};
+    inferno_header_t       header = {.type = INFERNO_REQUEST};
+    inferno_request_header request = {0};
 
     request.pid = pid;
     request.ep = ep;
@@ -254,13 +258,13 @@ static bool usb_write_request(AppleNCMHostState* s, int pid, uint8_t ep, const v
 }
 
 /* Reads one answer. `USB_RET_ASYNC` is a promise; the real one repeats the id. */
-static bool usb_read_response(AppleNCMHostState* s, tcp_usb_response_header* reply, uint8_t* buffer,
+static bool usb_read_response(AppleNCMHostState* s, inferno_response_header* reply, uint8_t* buffer,
                               uint16_t buffer_len, uint16_t* got)
 {
-    tcp_usb_header_t reply_header;
+    inferno_header_t reply_header;
 
     if (!read_exactly(s->fd, &reply_header, sizeof(reply_header))) { return false; }
-    if (reply_header.type != TCP_USB_RESPONSE) { return false; }
+    if (reply_header.type != INFERNO_RESPONSE) { return false; }
     if (!read_exactly(s->fd, reply, sizeof(*reply))) { return false; }
 
     *got = 0;
@@ -290,7 +294,7 @@ static int usb_packet_xfer(AppleNCMHostState* s, int pid, uint8_t ep, const void
     if (!usb_write_request(s, pid, ep, out, out_len, in_len, id)) { return USB_RET_IOERROR; }
 
     for (;;) {
-        tcp_usb_response_header reply;
+        inferno_response_header reply;
         uint8_t                 buffer[NCM_MAX_BLOCK];
         uint16_t                got = 0;
 
@@ -342,7 +346,7 @@ static int usb_control(AppleNCMHostState* s, uint8_t request_type, uint8_t reque
 
 static void usb_bus_reset(AppleNCMHostState* s)
 {
-    tcp_usb_header_t header = {.type = TCP_USB_RESET};
+    inferno_header_t header = {.type = INFERNO_RESET};
     write_all(s->fd, &header, sizeof(header));
     g_usleep(300 * 1000);
 }
@@ -859,7 +863,7 @@ static void* apple_ncm_host_thread(void* opaque)
     AppleNCMHostState* s = opaque;
 
     while (s->running) {
-        tcp_usb_response_header reply;
+        inferno_response_header reply;
         uint8_t                 buffer[NCM_MAX_BLOCK];
         uint16_t                got = 0;
         int32_t                 status;
@@ -1075,7 +1079,7 @@ static void apple_ncm_host_realize(DeviceState* dev, Error** errp)
     AppleNCMHostState* s = APPLE_NCM_HOST(dev);
     struct sockaddr_un addr = {0};
 
-    if (s->conn_addr == NULL) { s->conn_addr = g_strdup(USB_TCP_REMOTE_UNIX_DEFAULT); }
+    if (s->conn_addr == NULL) { s->conn_addr = g_strdup(NCM_HOST_UNIX_DEFAULT); }
     if (strlen(s->conn_addr) >= sizeof(addr.sun_path)) {
         error_setg(errp, "conn-addr too long: %s", s->conn_addr);
         return;

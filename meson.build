@@ -1369,12 +1369,6 @@ if host_os == 'darwin' and host_machine.subsystem() == 'ios' and have_system
                         required: false)
 endif
 
-libcbor = not_found
-if not get_option('libcbor').auto() or have_system
-  libcbor = dependency('libcbor', version: '>=0.7.0',
-                       required: get_option('libcbor'))
-endif
-
 gnutls = not_found
 if get_option('gnutls').enabled() or (get_option('gnutls').auto() and have_system)
   gnutls = dependency('gnutls', version: '>=3.5.18',
@@ -1528,6 +1522,12 @@ libdaxctl = not_found
 if not get_option('libdaxctl').auto() or have_system
   libdaxctl = dependency('libdaxctl', required: get_option('libdaxctl'),
                          version: '>=57', method: 'pkg-config')
+endif
+avahi = not_found
+avahi_glib = not_found
+if host_os == 'linux' and have_system
+  avahi = dependency('avahi-client', required: false, method: 'pkg-config')
+  avahi_glib = dependency('avahi-glib', required: false, method: 'pkg-config')
 endif
 tasn1 = dependency('libtasn1',
                    required: true,
@@ -1746,6 +1746,7 @@ endif
 config_host_data.set('CONFIG_GTK', gtk.found())
 config_host_data.set('CONFIG_VTE', vte.found())
 config_host_data.set('CONFIG_GTK_CLIPBOARD', have_gtk_clipboard)
+config_host_data.set('CONFIG_AVAHI', avahi.found() and avahi_glib.found())
 config_host_data.set('CONFIG_LIBCAP_NG', libcap_ng.found())
 config_host_data.set('CONFIG_LIBDAXCTL', libdaxctl.found())
 config_host_data.set('CONFIG_LIBNFS', libnfs.found())
@@ -2423,7 +2424,6 @@ config_target_mak = {}
 config_base_arch_mak = {}
 
 host_kconfig = \
-  (libcbor.found() ? ['CONFIG_LIBCBOR=y'] : []) + \
   (gnutls.found() ? ['CONFIG_GNUTLS=y'] : []) + \
   (x11.found() ? ['CONFIG_X11=y'] : []) + \
   (host_os == 'linux' ? ['CONFIG_LINUX=y'] : [])
@@ -3544,7 +3544,6 @@ summary_info += {'bzip2 support':     libbzip2}
 summary_info += {'zstd support':      zstd}
 summary_info += {'libpmem support':   libpmem}
 summary_info += {'libdaxctl support': libdaxctl}
-summary_info += {'libcbor support':   libcbor}
 summary_info += {'libudev':           libudev}
 # Dummy dependency, keep .found()
 summary_info += {'FUSE lseek':        fuse_lseek.found()}

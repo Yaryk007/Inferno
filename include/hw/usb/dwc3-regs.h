@@ -182,8 +182,8 @@
 #define GSTS_DEVICE_IP        BIT(6)
 #define GSTS_CSR_TIMEOUT      BIT(5)
 #define GSTS_BUS_ERR_ADDR_VLD BIT(4)
-#define GSTS_CURMOD_MASK(n)   (0x3)
-#define GSTS_CURMOD(n)        ((n) & GSTS_CURMOD_MASK)
+#define GSTS_CURMOD_MASK      (0x3)
+#define GSTS_CURMOD(_v)       ((_v) & GSTS_CURMOD_MASK)
 #define GSTS_CURMOD_DEVICE    0
 #define GSTS_CURMOD_HOST      1
 #define GSTS_CURMOD_DRD       2
@@ -275,8 +275,12 @@
 #define DCFG_LPM_CAP   BIT(22)
 #define DCFG_IGNSTRMPP BIT(23)
 
-#define DCFG_INTRNUM(_intr)  ((_intr) << 12)
-#define DCFG_INTRNUM_MASK    DCFG_INTRNUM(0xf)
+#define DCFG_NUMP(_n)     (((_n) & 0x1f) << 17)
+#define DCFG_NUMP_MASK    DCFG_NUMP(0x1f)
+#define DCFG_NUMP_GET(_v) (((_v) >> 17) & 0x1f)
+
+#define DCFG_INTRNUM(_intr)  (((_intr) & 0x1f) << 12)
+#define DCFG_INTRNUM_MASK    DCFG_INTRNUM(0x1f)
 #define DCFG_INTRNUM_GET(_v) (((_v) & DCFG_INTRNUM_MASK) >> 12)
 
 #define DCFG_DEVADDR(addr)   ((addr) << 3)
@@ -406,13 +410,16 @@
 #define DGCMDPAR_LOOPBACK_ENA        BIT(0)
 
 /* Device Endpoint Command Register */
-#define DEPCMD_PARAM_SHIFT   16
-#define DEPCMD_PARAM(x)      ((x) << DEPCMD_PARAM_SHIFT)
-#define DEPCMD_PARAM_MASK    DEPCMD_PARAM(0xffff)
-#define DEPCMD_STATUS        BIT(15)
-#define DEPCMD_HIPRI_FORCERM BIT(11)
-#define DEPCMD_CMDACT        BIT(10)
-#define DEPCMD_CMDIOC        BIT(8)
+#define DEPCMD_PARAM_SHIFT    16
+#define DEPCMD_PARAM(x)       ((x) << DEPCMD_PARAM_SHIFT)
+#define DEPCMD_PARAM_MASK     DEPCMD_PARAM(0xffff)
+#define DEPCMD_STATUS_SHIFT   12
+#define DEPCMD_STATUS_MASK    (0xf << DEPCMD_STATUS_SHIFT)
+#define DEPCMD_STATUS_SET(_v) (((_v) & 0xf) << DEPCMD_STATUS_SHIFT)
+#define DEPCMD_STATUS_GET(_v) (((_v) >> DEPCMD_STATUS_SHIFT) & 0xf)
+#define DEPCMD_HIPRI_FORCERM  BIT(11)
+#define DEPCMD_CMDACT         BIT(10)
+#define DEPCMD_CMDIOC         BIT(8)
 
 #define DEPCMD_STARTCFG   (0x09 << 0)
 #define DEPCMD_ENDXFER    (0x08 << 0)
@@ -428,8 +435,8 @@
 
 #define DEPCMD_XFERCFG     (0x02 << 0)
 #define DEPCMD_CFG         (0x01 << 0)
-#define DEPCMD_CMDMASK     (0xff << 0)
-#define DEPCMD_CMD_GET(_v) ((_v) & 0xff)
+#define DEPCMD_CMDMASK     (0xf << 0)
+#define DEPCMD_CMD_GET(_v) ((_v) & 0xf)
 
 /* The EP number goes 0..31 so ep0 is always out and ep1 is always in */
 #define DALEPENA_EP(n) BIT(n)
@@ -683,7 +690,7 @@ union dwc3_event
 #define DEPCFG_RSC_IDX_GET(x) (((x) >> DEPCMD_PARAM_SHIFT) & 0x7f)
 
 #define DEPCFG_EP_TYPE(n)         (((n) >> 1) & 0x3)
-#define DEPCFG_FIFO_NUMBER(n)     (((n) >> 17) & 0xf)
+#define DEPCFG_FIFO_NUMBER(n)     (((n) >> 17) & 0x1f)
 #define DEPCFG_MAX_PACKET_SIZE(n) (((n) >> 3) & 0x7ff)
 #define DEPCFG_ACTION(n)          (((n) >> 30) & 0x3)
 #define DEPCFG_BURST_SIZE(n)      (((n) >> 22) & 0xf)
