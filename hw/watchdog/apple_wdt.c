@@ -25,6 +25,8 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "system/watchdog.h"
+#include "ui/inferno-embed.h"
+#include "qemu/error-report.h"
 #include "trace.h"
 
 #define TYPE_APPLE_WDT "apple-wdt"
@@ -106,6 +108,18 @@ static void wdt_expired(AppleWDTState* s, const char* which, uint32_t counter)
 
     snprintf(origin, sizeof(origin), "the Apple watchdog (%s timer, set to %.1f s)", which,
              (double)counter / (double)s->cntfrq_hz);
+
+    /* The guest reaches for this when the reset it asked for does not come. */
+    if (inferno_resets_held()) {
+        static bool said;
+
+        if (!said) {
+            said = true;
+            info_report("%s wanted a reset; holding, as told", origin);
+        }
+        return;
+    }
+
     watchdog_perform_action_from(origin);
 }
 

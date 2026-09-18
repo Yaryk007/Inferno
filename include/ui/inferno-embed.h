@@ -133,6 +133,19 @@ bool inferno_net_link_up(void);
 void inferno_battery_set(int32_t percent, bool external, bool charging);
 
 /*
+ * Whether a reset the guest asks for is kept rather than acted on.
+ *
+ * A restore ends by asking for one, and that is the only moment anything can
+ * still reach the disk it has just written -- afterwards the ramdisk is gone
+ * and the storage goes back to being unreachable. Held, the guest simply idles:
+ * its filesystems are unmounted and its own watchdog is off by then. Both ways
+ * out are covered, the SMC key and the watchdog, because the guest falls back
+ * to the second when the first is ignored.
+ */
+void inferno_hold_resets(bool hold);
+bool inferno_resets_held(void);
+
+/*
  * The guest's vibration: how hard it drove its taptic engine and at what
  * frequency, one frame per INFERNO_HAPTIC_FRAME_MS of the actuator's own
  * samples. Lives in hw/audio/haptics.c.

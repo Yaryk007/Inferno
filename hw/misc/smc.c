@@ -19,6 +19,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/error-report.h"
 #include "hw/misc/a7iop/rtkit.h"
 #include "hw/misc/smc.h"
 #include "qapi/error.h"
@@ -69,6 +70,9 @@ struct AppleSMCState
     uint8_t* sram;
     uint32_t sram_size;
     bool     is_booted;
+    /* Keep the guest's reset request rather than acting on it -- see the `rest`
+     * key below. */
+    bool hold_reset;
 };
 
 SMCKey* apple_smc_get_key(AppleSMCState* s, uint32_t key)
@@ -229,7 +233,19 @@ static SMCResult apple_smc_mbse_write(SMCKey* key, SMCKeyData* data, const void*
     switch (value) {
         case 'susp':    // seems to mean suspend SoC, not AP.
         case 'offw': qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN); return SMC_RESULT_SUCCESS;
-        case 'rest': qemu_system_reset_request_from(SHUTDOWN_CAUSE_GUEST_RESET, "the SMC (key rest)"); return SMC_RESULT_SUCCESS;
+        case 'rest':
+            /* A restore ends by asking for a reset, and the machine is then
+             * done with the disk it just wrote -- which is the one moment
+             * anything on the host can still reach that disk through the
+             * ramdisk. Held here, the guest simply idles: its filesystems are
+             * already unmounted and its watchdog is off, so nothing expects the
+             * power to go. The host resets it over QMP when it has finished. */
+            if (inferno_resets_held()) {
+                info_report("SMC: the guest asked to reset; holding, as told");
+                return SMC_RESULT_SUCCESS;
+            }
+            qemu_system_reset_request_from(SHUTDOWN_CAUSE_GUEST_RESET, "the SMC (key rest)");
+            return SMC_RESULT_SUCCESS;
         case 'waka':    // FIXME: Are we supposed to do anything here?
             return SMC_RESULT_SUCCESS;
         case 'slpa':    // Ditto
@@ -793,6 +809,20 @@ static void apple_smc_reset_hold(Object* obj, ResetType type)
     s->is_booted = false;
 }
 
+static bool held_resets;
+
+void inferno_hold_resets(bool hold) { held_resets = hold; }
+
+bool inferno_resets_held(void) { return held_resets; }
+
+static bool apple_smc_get_hold_reset(Object* obj, Error** errp) { return APPLE_SMC_IOP(obj)->hold_reset; }
+
+static void apple_smc_set_hold_reset(Object* obj, bool value, Error** errp)
+{
+    APPLE_SMC_IOP(obj)->hold_reset = value;
+    inferno_hold_resets(value);
+}
+
 static void apple_smc_class_init(ObjectClass* klass, const void* data)
 {
     ResettableClass* rc;
@@ -814,6 +844,7 @@ static void apple_smc_class_init(ObjectClass* klass, const void* data)
                                    apple_smc_set_battery_external);
     object_class_property_add_bool(klass, "battery-charging", apple_smc_get_battery_charging,
                                    apple_smc_set_battery_charging);
+    object_class_property_add_bool(klass, "hold-reset", apple_smc_get_hold_reset, apple_smc_set_hold_reset);
 }
 
 static const TypeInfo apple_smc_info = {
