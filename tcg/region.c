@@ -30,6 +30,7 @@
 #include "qemu/cacheinfo.h"
 #include "qemu/qtree.h"
 #include "qapi/error.h"
+#include "qemu/error-report.h"
 #include "tcg/tcg.h"
 #include "exec/translation-block.h"
 #include "tcg-internal.h"
@@ -597,8 +598,21 @@ static int alloc_code_gen_buffer_splitwx_vmremap(size_t size, Error** errp)
 
     #if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
     if (__builtin_available(iOS 26, *)) {
-        /* Hand the executable mapping to the debugger to bless. */
-        if (is_debugger_attached()) { break_prepare_jit_region(buf_rx, size); }
+        /* Hand the executable mapping to the debugger to bless.
+         *
+         * Said out loud both ways. Skipping this leaves the mapping unblessed,
+         * and the guest then stands on the first instruction it translates,
+         * burning one core with nothing on its console -- a failure that looks
+         * like a hang anywhere else in the machine, and cost a day of looking
+         * in the wrong places once. */
+        if (is_debugger_attached()) {
+            info_report("JIT: asking the debugger to bless %zu bytes at %p", size, (void*)buf_rx);
+            break_prepare_jit_region(buf_rx, size);
+        }
+        else {
+            warn_report("JIT: no debugger attached, the code buffer stays unexecutable -- "
+                        "the machine will stand still. Launch through the JIT enabler.");
+        }
 
         /* Only now can the first mapping become writable. */
         if (mprotect((void*)buf_rw, size, PROT_READ | PROT_WRITE) != 0) {
