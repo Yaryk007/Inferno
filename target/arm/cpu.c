@@ -126,7 +126,7 @@ static bool arm_cpu_has_work(CPUState* cs)
 {
     ARMCPU* cpu = container_of(cs, ARMCPU, parent_obj);
 
-    return (cpu->power_state != PSCI_OFF)
+    return (cpu->power_state != ARM_POWER_OFF)
            && cpu_test_interrupt(cs, CPU_INTERRUPT_FIQ | CPU_INTERRUPT_HARD | CPU_INTERRUPT_NMI | CPU_INTERRUPT_VINMI
                                          | CPU_INTERRUPT_VFNMI | CPU_INTERRUPT_VFIQ | CPU_INTERRUPT_VIRQ
                                          | CPU_INTERRUPT_VSERR | CPU_INTERRUPT_EXITTB);
@@ -231,7 +231,7 @@ static void arm_cpu_reset_hold(Object* obj, ResetType type)
     env->vfp.xregs[ARM_VFP_MVFR1] = cpu->isar.mvfr1;
     env->vfp.xregs[ARM_VFP_MVFR2] = cpu->isar.mvfr2;
 
-    cpu->power_state = cs->start_powered_off ? PSCI_OFF : PSCI_ON;
+    cpu->power_state = cs->start_powered_off ? ARM_POWER_OFF : ARM_POWER_ON;
 
     if (arm_feature(env, ARM_FEATURE_IWMMXT)) { env->iwmmxt.cregs[ARM_IWMMXT_wCID] = 0x69051000 | 'Q'; }
 
@@ -671,13 +671,7 @@ static void arm_cpu_initfn(Object* obj)
 
     qdev_init_gpio_out_named(DEVICE(cpu), &cpu->pmu_interrupt, "pmu-interrupt", 1);
 
-    cpu->psci_version = QEMU_PSCI_VERSION_0_1; /* By default assume PSCI v0.1 */
-    cpu->kvm_target   = QEMU_KVM_ARM_TARGET_NONE;
-
-    if (tcg_enabled() || hvf_enabled()) {
-        /* TCG and HVF implement PSCI 1.1 */
-        cpu->psci_version = QEMU_PSCI_VERSION_1_1;
-    }
+    cpu->kvm_target = QEMU_KVM_ARM_TARGET_NONE;
 }
 
 /*
@@ -936,9 +930,6 @@ static void arm_cpu_post_init(Object* obj)
         if (tcg_enabled()) { qdev_property_add_static(DEVICE(obj), &arm_cpu_has_neon_property); }
     }
 
-    /* Not DEFINE_PROP_UINT32: we want this to be settable after realize */
-    object_property_add_uint32_ptr(obj, "psci-conduit", &cpu->psci_conduit, OBJ_PROP_FLAG_READWRITE);
-
     if (arm_feature(&cpu->env, ARM_FEATURE_GENERIC_TIMER)) {
         qdev_property_add_static(DEVICE(cpu), &arm_cpu_gt_cntfrq_property);
     }
@@ -1046,9 +1037,7 @@ static void arm_cpu_realizefn(DeviceState* dev, Error** errp)
      * this is the first point where we can report it.
      */
     if (cpu->host_cpu_probe_failed) {
-        if (!hwaccel_enabled()) {
-            error_setg(errp, "The 'host' CPU type can only be used with hwaccel");
-        }
+        if (!hwaccel_enabled()) { error_setg(errp, "The 'host' CPU type can only be used with hwaccel"); }
         else {
             error_setg(errp, "Failed to retrieve host CPU features");
         }
@@ -1587,10 +1576,9 @@ void arm_cpu_register(const ARMCPUInfo* info)
 }
 
 static const TypeInfo arm_cpu_type_info = {
-    .name              = TYPE_ARM_CPU,
-    .parent            = TYPE_CPU,
-    .instance_size     = sizeof(ARMCPU),
-    .instance_align    = __alignof__(ARMCPU),
+    .name   = TYPE_ARM_CPU,
+    .parent = TYPE_CPU,
+    OBJECT_TYPE_INSTANCE(ARMCPU),
     .instance_init     = arm_cpu_initfn,
     .instance_finalize = arm_cpu_finalizefn,
     .abstract          = true,
@@ -1598,6 +1586,4 @@ static const TypeInfo arm_cpu_type_info = {
     .class_init        = arm_cpu_class_init,
 };
 
-static void arm_cpu_register_types(void) { type_register_static(&arm_cpu_type_info); }
-
-type_init(arm_cpu_register_types)
+DEFINE_TYPE(arm_cpu_type_info)

@@ -12,9 +12,6 @@
 #include "exec/translation-block.h"
 #include "accel/tcg/tb-cpu-state.h"
 
-extern int64_t max_delay;
-extern int64_t max_advance;
-
 extern bool one_insn_per_tb;
 
 /*
@@ -90,8 +87,6 @@ static inline void assert_no_pages_locked(void) { }
 #endif
 
 void page_table_config_init(void);
-
-G_NORETURN void cpu_io_recompile(CPUState* cpu, uintptr_t retaddr);
 
 void tb_phys_invalidate(TranslationBlock* tb, tb_page_addr_t page_addr);
 void tb_set_jmp_target(TranslationBlock* tb, int n, uintptr_t addr);

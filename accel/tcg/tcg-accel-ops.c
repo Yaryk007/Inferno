@@ -1,7 +1,7 @@
 /*
  * QEMU TCG vCPU common functionality
  *
- * Functionality common to all TCG vCPU variants: mttcg, rr and icount.
+ * Functionality common to all TCG vCPU variants: mttcg and rr.
  *
  * Copyright (c) 2003-2008 Fabrice Bellard
  * Copyright (c) 2014 Red Hat Inc.
@@ -96,7 +96,7 @@ void tcg_handle_interrupt(CPUState* cpu, int mask)
      */
     if (!qemu_cpu_is_self(cpu)) { qemu_cpu_kick(cpu); }
     else {
-        qatomic_set(&cpu->neg.icount_decr.u16.high, -1);
+        qatomic_set(&cpu->neg.tb_exit_request, true);
     }
 }
 
@@ -211,5 +211,4 @@ static const TypeInfo tcg_accel_ops_type = {
 };
 module_obj(ACCEL_OPS_NAME("tcg"));
 
-static void tcg_accel_ops_register_types(void) { type_register_static(&tcg_accel_ops_type); }
-type_init(tcg_accel_ops_register_types);
+DEFINE_TYPE(tcg_accel_ops_type)

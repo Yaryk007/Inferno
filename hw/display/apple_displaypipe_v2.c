@@ -239,16 +239,7 @@ static void adp_v2_class_init(ObjectClass* klass, const void* data)
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
 }
 
-static const TypeInfo adp_v2_type_info = {
-    .name          = TYPE_APPLE_DISPLAY_PIPE_V2,
-    .parent        = TYPE_SYS_BUS_DEVICE,
-    .instance_size = sizeof(AppleDisplayPipeV2State),
-    .class_init    = adp_v2_class_init,
-};
-
-static void adp_v2_register_types(void) { type_register_static(&adp_v2_type_info); }
-
-type_init(adp_v2_register_types);
+OBJECT_DEFINE_SIMPLE_TYPE_CLASS_INIT(AppleDisplayPipeV2State, adp_v2, APPLE_DISPLAY_PIPE_V2, SYS_BUS_DEVICE)
 
 SysBusDevice* adp_v2_from_node(AppleDTNode* node, MemoryRegion* dma_mr, AppleVideoArgs* video_args, uint64_t vram_size)
 {
@@ -275,7 +266,7 @@ SysBusDevice* adp_v2_from_node(AppleDTNode* node, MemoryRegion* dma_mr, AppleVid
 
     s->dma_mr = dma_mr;
 
-    assert_nonnull(object_property_add_const_link(OBJECT(s), "dma_mr", OBJECT(dma_mr)));
+    object_property_add_const_link(OBJECT(s), "dma_mr", OBJECT(dma_mr));
     address_space_init(&s->dma_as, dma_mr, "disp0.dma");
 
     memory_region_init_ram(&s->vram, OBJECT(s), "vram", vram_size, &error_fatal);

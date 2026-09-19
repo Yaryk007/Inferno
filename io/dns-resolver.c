@@ -128,7 +128,7 @@ int qio_dns_resolver_lookup_sync(QIODNSResolver* resolver, SocketAddress* addr, 
         case SOCKET_ADDRESS_TYPE_VSOCK:
         case SOCKET_ADDRESS_TYPE_FD   : return qio_dns_resolver_lookup_sync_nop(resolver, addr, naddrs, addrs, errp);
 
-        default: abort();
+        default: assert_not_reached();
     }
 }
 
@@ -194,11 +194,9 @@ void qio_dns_resolver_lookup_result(QIODNSResolver* resolver, QIOTask* task, siz
 }
 
 static const TypeInfo qio_dns_resolver_info = {
-    .parent        = TYPE_OBJECT,
-    .name          = TYPE_QIO_DNS_RESOLVER,
-    .instance_size = sizeof(QIODNSResolver),
+    .parent = TYPE_OBJECT,
+    .name   = TYPE_QIO_DNS_RESOLVER,
+    OBJECT_TYPE_INSTANCE(QIODNSResolver),
 };
 
-static void qio_dns_resolver_register_types(void) { type_register_static(&qio_dns_resolver_info); }
-
-type_init(qio_dns_resolver_register_types);
+DEFINE_TYPE(qio_dns_resolver_info)

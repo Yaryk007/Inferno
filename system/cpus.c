@@ -190,26 +190,6 @@ int64_t cpus_get_virtual_clock(void)
     return cpu_get_clock();
 }
 
-/*
- * Signal the new virtual time to the accelerator. This is only needed
- * by accelerators that need to track the changes as we warp time.
- */
-void cpus_set_virtual_clock(int64_t new_time)
-{
-    if (cpus_accel && cpus_accel->set_virtual_clock) { cpus_accel->set_virtual_clock(new_time); }
-}
-
-/*
- * return the time elapsed in VM between vm_start and vm_stop.  Unless
- * icount is active, cpus_get_elapsed_ticks() uses units of the host CPU cycle
- * counter.
- */
-int64_t cpus_get_elapsed_ticks(void)
-{
-    if (cpus_accel->get_elapsed_ticks) { return cpus_accel->get_elapsed_ticks(); }
-    return cpu_get_ticks();
-}
-
 void cpu_set_interrupt(CPUState* cpu, int mask)
 {
     /* Pairs with cpu_test_interrupt(). */
@@ -242,7 +222,7 @@ static int do_vm_stop(RunState state, bool send_stop)
     if (runstate_is_live(oldstate)) {
         vm_was_suspended = (oldstate == RUN_STATE_SUSPENDED);
         runstate_set(state);
-        cpu_disable_ticks();
+        vm_clock_disable();
         if (oldstate == RUN_STATE_RUNNING) { pause_all_vcpus(); }
         ret = vm_state_notify(0, state);
         if (send_stop) { qapi_event_send_stop(); }
@@ -348,7 +328,8 @@ void qemu_init_cpu_loop(void)
 
 void run_on_cpu(CPUState* cpu, run_on_cpu_func func, run_on_cpu_data data) { do_run_on_cpu(cpu, func, data, &bql); }
 
-static void qemu_cpu_stop(CPUState* cpu, bool exit)
+/* Acknowledge a stop request made by another thread via cpu_pause(). */
+static void qemu_cpu_ack_stop_request(CPUState* cpu, bool exit)
 {
     assert(qemu_cpu_is_self(cpu));
     cpu->stop    = false;
@@ -360,7 +341,7 @@ static void qemu_cpu_stop(CPUState* cpu, bool exit)
 void qemu_process_cpu_events_common(CPUState* cpu)
 {
     qatomic_set_mb(&cpu->thread_kicked, false);
-    if (cpu->stop) { qemu_cpu_stop(cpu, false); }
+    if (cpu->stop) { qemu_cpu_ack_stop_request(cpu, false); }
     process_queued_cpu_work(cpu);
 }
 
@@ -394,6 +375,7 @@ void qemu_cpu_kick(CPUState* cpu)
     }
 }
 
+/* Kick the vCPU running in this thread out of guest execution. */
 void qemu_cpu_kick_self(void)
 {
     assert(current_cpu);
@@ -405,6 +387,7 @@ bool qemu_cpu_is_self(CPUState* cpu) { return qemu_thread_is_self(cpu->thread); 
 bool qemu_in_vcpu_thread(void) { return current_cpu && qemu_cpu_is_self(current_cpu); }
 
 QEMU_DEFINE_STATIC_CO_TLS(bool, bql_locked)
+QEMU_DEFINE_STATIC_CO_TLS(unsigned, bql_lockless_depth)
 
 bool bql_locked(void) { return get_bql_locked(); }
 
@@ -419,6 +402,8 @@ void bql_lock_impl(const char* file, int line)
     QemuMutexLockFunc bql_lock_fn = qatomic_read(&bql_mutex_lock_func);
 
     assert(!bql_locked());
+    assert(get_bql_lockless_depth() == 0);
+
     bql_lock_fn(&bql, file, line);
     set_bql_locked(true);
 }
@@ -428,6 +413,14 @@ void bql_unlock(void)
     assert(bql_locked());
     set_bql_locked(false);
     qemu_mutex_unlock(&bql);
+}
+
+void bql_lockless_section_begin(void) { set_bql_lockless_depth(get_bql_lockless_depth() + 1); }
+
+void bql_lockless_section_end(void)
+{
+    assert(get_bql_lockless_depth() > 0);
+    set_bql_lockless_depth(get_bql_lockless_depth() - 1);
 }
 
 void qemu_cond_wait_bql(QemuCond* cond) { qemu_cond_wait(cond, &bql); }
@@ -450,7 +443,7 @@ void cpu_thread_signal_destroyed(CPUState* cpu)
 
 void cpu_pause(CPUState* cpu)
 {
-    if (qemu_cpu_is_self(cpu)) { qemu_cpu_stop(cpu, true); }
+    if (qemu_cpu_is_self(cpu)) { qemu_cpu_ack_stop_request(cpu, true); }
     else {
         cpu->stop = true;
         cpu_exit(cpu);
@@ -548,7 +541,8 @@ void qemu_init_vcpu(CPUState* cpu)
     while (!cpu->created) { qemu_cond_wait(&qemu_cpu_cond, &bql); }
 }
 
-void cpu_stop_current(void)
+/* Ask the vCPU running in this thread to stop at its next opportunity. */
+void qemu_cpu_stop_self(void)
 {
     if (current_cpu) {
         current_cpu->stop = true;
@@ -565,7 +559,7 @@ int vm_stop(RunState state)
          * FIXME: should not return to device code in case
          * vm_stop() has been requested.
          */
-        cpu_stop_current();
+        qemu_cpu_stop_self();
         return 0;
     }
 
@@ -606,7 +600,7 @@ int vm_prepare_start(bool step_pending)
     /* We are sending this now, but the CPUs will be resumed shortly later */
     qapi_event_send_resume();
 
-    cpu_enable_ticks();
+    vm_clock_enable();
     runstate_set(state);
     vm_state_notify(1, state);
     vm_was_suspended = false;

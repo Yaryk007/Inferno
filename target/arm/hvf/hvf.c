@@ -242,7 +242,8 @@ void hvf_arm_init_debug(void)
 #define TMR_CTL_IMASK   (1 << 1)
 #define TMR_CTL_ISTATUS (1 << 2)
 
-static void hvf_wfi(CPUState* cpu);
+static int  hvf_wfi(CPUState* cpu);
+static void hvf_wfi_timer_cb(void* opaque);
 
 static uint32_t chosen_ipa_bit_size;
 
@@ -794,6 +795,11 @@ void hvf_arch_vcpu_destroy(CPUState* cpu)
 {
     hv_return_t ret;
 
+    if (cpu->accel->wfi_timer != NULL) {
+        timer_free(cpu->accel->wfi_timer);
+        cpu->accel->wfi_timer = NULL;
+    }
+
     ret = hv_vcpu_destroy(cpu->accel->fd);
     assert_hvf_ok(ret);
 }
@@ -824,6 +830,8 @@ int hvf_arch_init_vcpu(CPUState* cpu)
     hv_return_t  ret;
     int          i;
     bool         success;
+
+    cpu->accel->wfi_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, hvf_wfi_timer_cb, cpu);
 
     env->aarch64 = true;
     asm volatile("mrs %0, cntfrq_el0" : "=r"(arm_cpu->gt_cntfrq_hz));
@@ -894,125 +902,6 @@ static void hvf_raise_exception(CPUState* cpu, uint32_t excp, uint32_t syndrome,
     env->exception.syndrome  = syndrome;
 
     arm_cpu_do_interrupt(cpu);
-}
-
-static void hvf_psci_cpu_off(ARMCPU* arm_cpu)
-{
-    int32_t ret = arm_set_cpu_off(arm_cpu_mp_affinity(arm_cpu));
-    assert(ret == QEMU_ARM_POWERCTL_RET_SUCCESS);
-}
-
-/*
- * Handle a PSCI call.
- *
- * Returns 0 on success
- *         -1 when the PSCI call is unknown,
- */
-static bool hvf_handle_psci_call(CPUState* cpu)
-{
-    ARMCPU*      arm_cpu  = ARM_CPU(cpu);
-    CPUARMState* env      = &arm_cpu->env;
-    uint64_t     param[4] = {env->xregs[0], env->xregs[1], env->xregs[2], env->xregs[3]};
-    uint64_t     context_id, mpidr;
-    bool         target_aarch64 = true;
-    CPUState*    target_cpu_state;
-    ARMCPU*      target_cpu;
-    target_ulong entry;
-    int          target_el = 1;
-    int32_t      ret       = 0;
-
-    trace_hvf_psci_call(param[0], param[1], param[2], param[3], arm_cpu_mp_affinity(arm_cpu));
-
-    switch (param[0]) {
-        case QEMU_PSCI_0_2_FN_PSCI_VERSION: ret = QEMU_PSCI_VERSION_1_1; break;
-        case QEMU_PSCI_0_2_FN_MIGRATE_INFO_TYPE:
-            ret = QEMU_PSCI_0_2_RET_TOS_MIGRATION_NOT_REQUIRED; /* No trusted OS */
-            break;
-        case QEMU_PSCI_0_2_FN_AFFINITY_INFO:
-        case QEMU_PSCI_0_2_FN64_AFFINITY_INFO:
-            mpidr = param[1];
-
-            switch (param[2]) {
-                case 0:
-                    target_cpu_state = arm_get_cpu_by_id(mpidr);
-                    if (!target_cpu_state) {
-                        ret = QEMU_PSCI_RET_INVALID_PARAMS;
-                        break;
-                    }
-                    target_cpu = ARM_CPU(target_cpu_state);
-
-                    ret = target_cpu->power_state;
-                    break;
-                default:
-                    /* Everything above affinity level 0 is always on. */
-                    ret = 0;
-            }
-            break;
-        case QEMU_PSCI_0_2_FN_SYSTEM_RESET:
-            qemu_system_reset_request_from(SHUTDOWN_CAUSE_GUEST_RESET, "PSCI SYSTEM_RESET");
-            /*
-             * QEMU reset and shutdown are async requests, but PSCI
-             * mandates that we never return from the reset/shutdown
-             * call, so power the CPU off now so it doesn't execute
-             * anything further.
-             */
-            hvf_psci_cpu_off(arm_cpu);
-            break;
-        case QEMU_PSCI_0_2_FN_SYSTEM_OFF:
-            qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
-            hvf_psci_cpu_off(arm_cpu);
-            break;
-        case QEMU_PSCI_0_1_FN_CPU_ON:
-        case QEMU_PSCI_0_2_FN_CPU_ON:
-        case QEMU_PSCI_0_2_FN64_CPU_ON:
-            mpidr      = param[1];
-            entry      = param[2];
-            context_id = param[3];
-            ret        = arm_set_cpu_on(mpidr, entry, context_id, target_el, target_aarch64);
-            break;
-        case QEMU_PSCI_0_1_FN_CPU_OFF    :
-        case QEMU_PSCI_0_2_FN_CPU_OFF    : hvf_psci_cpu_off(arm_cpu); break;
-        case QEMU_PSCI_0_1_FN_CPU_SUSPEND:
-        case QEMU_PSCI_0_2_FN_CPU_SUSPEND:
-        case QEMU_PSCI_0_2_FN64_CPU_SUSPEND:
-            /* Affinity levels are not supported in QEMU */
-            if (param[1] & 0xfffe0000) {
-                ret = QEMU_PSCI_RET_INVALID_PARAMS;
-                break;
-            }
-            /* Powerdown is not supported, we always go into WFI */
-            env->xregs[0] = 0;
-            hvf_wfi(cpu);
-            break;
-        case QEMU_PSCI_0_1_FN_MIGRATE:
-        case QEMU_PSCI_0_2_FN_MIGRATE: ret = QEMU_PSCI_RET_NOT_SUPPORTED; break;
-        case QEMU_PSCI_1_0_FN_PSCI_FEATURES:
-            switch (param[1]) {
-                case QEMU_PSCI_0_2_FN_PSCI_VERSION     :
-                case QEMU_PSCI_0_2_FN_MIGRATE_INFO_TYPE:
-                case QEMU_PSCI_0_2_FN_AFFINITY_INFO    :
-                case QEMU_PSCI_0_2_FN64_AFFINITY_INFO  :
-                case QEMU_PSCI_0_2_FN_SYSTEM_RESET     :
-                case QEMU_PSCI_0_2_FN_SYSTEM_OFF       :
-                case QEMU_PSCI_0_1_FN_CPU_ON           :
-                case QEMU_PSCI_0_2_FN_CPU_ON           :
-                case QEMU_PSCI_0_2_FN64_CPU_ON         :
-                case QEMU_PSCI_0_1_FN_CPU_OFF          :
-                case QEMU_PSCI_0_2_FN_CPU_OFF          :
-                case QEMU_PSCI_0_1_FN_CPU_SUSPEND      :
-                case QEMU_PSCI_0_2_FN_CPU_SUSPEND      :
-                case QEMU_PSCI_0_2_FN64_CPU_SUSPEND    :
-                case QEMU_PSCI_1_0_FN_PSCI_FEATURES    : ret = 0; break;
-                case QEMU_PSCI_0_1_FN_MIGRATE          :
-                case QEMU_PSCI_0_2_FN_MIGRATE          :
-                default                                : ret = QEMU_PSCI_RET_NOT_SUPPORTED;
-            }
-            break;
-        default: return false;
-    }
-
-    env->xregs[0] = ret;
-    return true;
 }
 
 static bool is_id_sysreg(uint32_t reg)
@@ -1502,18 +1391,6 @@ static uint64_t hvf_vtimer_val(void)
     return hvf_vtimer_val_raw();
 }
 
-static void hvf_wait_for_ipi(CPUState* cpu, struct timespec* ts)
-{
-    /*
-     * Use pselect to sleep so that other threads can IPI us while we're
-     * sleeping.
-     */
-    qatomic_set_mb(&cpu->thread_kicked, false);
-    bql_unlock();
-    pselect(0, 0, 0, 0, ts, &cpu->accel->unblock_ipi_mask);
-    bql_lock();
-}
-
 static int64_t hvf_vtimer_deadline_ns(CPUState* cpu)
 {
     ARMCPU*     arm_cpu = ARM_CPU(cpu);
@@ -1555,36 +1432,32 @@ static int64_t hvf_ptimer_deadline_ns(CPUState* cpu)
     return expire <= now ? 0 : expire - now;
 }
 
-static void hvf_wfi(CPUState* cpu)
+static void hvf_wfi_timer_cb(void* opaque)
 {
-    struct timespec ts;
-    int64_t         nanos;
-    int64_t         deadline;
+    CPUState* cpu = opaque;
 
-    if (cpu_test_interrupt(cpu, CPU_INTERRUPT_HARD | CPU_INTERRUPT_FIQ)) {
-        /* Interrupt pending, no need to wait */
-        return;
-    }
+    cpu->halted = 0;
+    qemu_cpu_kick(cpu);
+}
+
+static int hvf_wfi(CPUState* cpu)
+{
+    int64_t nanos;
+    int64_t deadline;
+
+    if (cpu_has_work(cpu)) { return 0; }
 
     nanos    = hvf_vtimer_deadline_ns(cpu);
     deadline = hvf_ptimer_deadline_ns(cpu);
     if (deadline < nanos) { nanos = deadline; }
 
-    if (nanos == INT64_MAX) {
-        /* No timer armed, just wait for an IPI. */
-        hvf_wait_for_ipi(cpu, NULL);
-        return;
-    }
+    /* Already due: stay in the guest. */
+    if (nanos == 0) { return 0; }
 
-    /*
-     * Don't sleep for less than the time a context switch would take,
-     * so that we can satisfy fast timer requests on the same CPU.
-     * Measurements on M1 show the sweet spot to be ~2ms.
-     */
-    if (nanos < (2 * SCALE_MS)) { return; }
+    if (nanos != INT64_MAX) { timer_mod_ns(cpu->accel->wfi_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + nanos); }
 
-    ts = (struct timespec){nanos / NANOSECONDS_PER_SECOND, nanos % NANOSECONDS_PER_SECOND};
-    hvf_wait_for_ipi(cpu, &ts);
+    cpu->halted = 1;
+    return EXCP_HLT;
 }
 
 /* Must be called by the owning thread */
@@ -1735,41 +1608,17 @@ static int hvf_handle_exception(CPUState* cpu, hv_vcpu_exit_exception_t* excp)
         }
         case EC_WFX_TRAP:
             advance_pc = true;
-            if (!(syndrome & WFX_IS_WFE)) { hvf_wfi(cpu); }
+            if (!(syndrome & WFX_IS_WFE)) { ret = hvf_wfi(cpu); }
             break;
         case EC_AA64_HVC:
             cpu_synchronize_state(cpu);
-            if (arm_cpu->psci_conduit == QEMU_PSCI_CONDUIT_HVC) {
-                /* Do NOT advance $pc for HVC */
-                if (!hvf_handle_psci_call(cpu)) {
-                    trace_hvf_unknown_hvc(env->pc, env->xregs[0]);
-                    /* SMCCC 1.3 section 5.2 says every unknown SMCCC call returns -1 */
-                    env->xregs[0] = -1;
-                }
-                cpu->vcpu_dirty = true;
-            }
-            else {
-                trace_hvf_unknown_hvc(env->pc, env->xregs[0]);
-                hvf_raise_exception(cpu, EXCP_UDEF, syn_uncategorized(), 1);
-            }
+            trace_hvf_unknown_hvc(env->pc, env->xregs[0]);
+            hvf_raise_exception(cpu, EXCP_UDEF, syn_uncategorized(), 1);
             break;
         case EC_AA64_SMC:
             cpu_synchronize_state(cpu);
-            if (arm_cpu->psci_conduit == QEMU_PSCI_CONDUIT_SMC) {
-                /* Secure Monitor Call exception, we need to advance $pc */
-                advance_pc = true;
-
-                if (!hvf_handle_psci_call(cpu)) {
-                    trace_hvf_unknown_smc(env->xregs[0]);
-                    /* SMCCC 1.3 section 5.2 says every unknown SMCCC call returns -1 */
-                    env->xregs[0] = -1;
-                }
-                cpu->vcpu_dirty = true;
-            }
-            else {
-                trace_hvf_unknown_smc(env->xregs[0]);
-                hvf_raise_exception(cpu, EXCP_UDEF, syn_uncategorized(), 1);
-            }
+            trace_hvf_unknown_smc(env->xregs[0]);
+            hvf_raise_exception(cpu, EXCP_UDEF, syn_uncategorized(), 1);
             break;
         case EC_INSNABORT: {
             uint32_t set   = (syndrome >> 12) & 3;
@@ -1833,21 +1682,29 @@ static int hvf_handle_vmexit(CPUState* cpu, hv_vcpu_exit_t* exit)
 
 int hvf_arch_vcpu_exec(CPUState* cpu)
 {
-    int         ret;
+    int         ret = 0;
     hv_return_t r;
 
-    if (cpu->halted) { return EXCP_HLT; }
+    if (cpu->halted) {
+        if (!cpu_has_work(cpu)) { return EXCP_HLT; }
 
-    flush_cpu_state(cpu);
+        cpu->halted = 0;
+        timer_del(cpu->accel->wfi_timer);
+    }
 
+    bql_unlock();
+    cpu_exec_start(cpu);
+
+    /* Inner vCPU loop: executes guest code, runs without the BQL. */
     do {
-        if (!(cpu->singlestep_enabled & SSTEP_NOIRQ) && hvf_inject_interrupts(cpu)) { return EXCP_INTERRUPT; }
+        flush_cpu_state(cpu);
 
-        bql_unlock();
-        cpu_exec_start(cpu);
+        if (!(cpu->singlestep_enabled & SSTEP_NOIRQ) && hvf_inject_interrupts(cpu)) {
+            ret = EXCP_INTERRUPT;
+            break;
+        }
+
         r = hv_vcpu_run(cpu->accel->fd);
-        cpu_exec_end(cpu);
-        bql_lock();
         switch (r) {
             case HV_SUCCESS: ret = hvf_handle_vmexit(cpu, cpu->accel->exit); break;
             case HV_ILLEGAL_GUEST_STATE:
@@ -1857,6 +1714,9 @@ int hvf_arch_vcpu_exec(CPUState* cpu)
         }
     }
     while (ret == 0);
+
+    cpu_exec_end(cpu);
+    bql_lock();
 
     return ret;
 }

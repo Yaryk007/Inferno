@@ -503,7 +503,7 @@ static bool nvme_ns_init_fdp(NvmeNamespace* ns, Error** errp)
 
             case NVME_RUHA_CTRL: error_setg(errp, "reclaim unit handle is controller assigned"); return false;
 
-            default: abort();
+            default: assert_not_reached();
         }
 
         *ph = *ruhid;
@@ -792,13 +792,4 @@ static void nvme_ns_class_init(ObjectClass* oc, const void* data)
     dc->desc = "Virtual NVMe namespace";
 }
 
-static const TypeInfo nvme_ns_info = {
-    .name          = TYPE_NVME_NS,
-    .parent        = TYPE_DEVICE,
-    .class_init    = nvme_ns_class_init,
-    .instance_size = sizeof(NvmeNamespace),
-};
-
-static void nvme_ns_register_types(void) { type_register_static(&nvme_ns_info); }
-
-type_init(nvme_ns_register_types)
+OBJECT_DEFINE_SIMPLE_TYPE_CLASS_INIT(NvmeNamespace, nvme_ns, NVME_NS, DEVICE)

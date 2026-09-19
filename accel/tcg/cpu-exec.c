@@ -42,26 +42,6 @@
 #include "tb-internal.h"
 #include "internal-common.h"
 
-/* -icount align implementation. */
-
-typedef struct SyncClocks
-{
-    int64_t diff_clk;
-    int64_t realtime_clock;
-} SyncClocks;
-
-/* Allow the guest to have a max 3ms advance.
- * The difference between the 2 clocks could therefore
- * oscillate around 0.
- */
-#define VM_CLOCK_ADVANCE     3000000
-#define THRESHOLD_REDUCE     1.5
-#define MAX_DELAY_PRINT_RATE 2000000000LL
-#define MAX_NB_PRINTS        100
-
-int64_t max_delay;
-int64_t max_advance;
-
 struct tb_desc
 {
     TCGTBCPUState  s;
@@ -273,15 +253,6 @@ const void* HELPER(lookup_tb_ptr)(CPUArchState* env)
     CPUState*         cpu = env_cpu(env);
     TranslationBlock* tb;
 
-    /*
-     * By definition we've just finished a TB, so I/O is OK.
-     * Avoid the possibility of calling cpu_io_recompile() if
-     * a page table walk triggered by tb_lookup() calling
-     * probe_access_internal() happens to touch an MMIO device.
-     * The next TB, if we chain to it, will clear the flag again.
-     */
-    cpu->neg.can_do_io = true;
-
     TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
     s.cflags        = curr_cflags(cpu);
 
@@ -323,8 +294,7 @@ static inline TranslationBlock* QEMU_DISABLE_CFI cpu_tb_exec(CPUState* cpu, Tran
     if (qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC)) { log_cpu_exec(log_pc(cpu, itb), cpu, itb); }
 
     qemu_thread_jit_execute();
-    ret                = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
-    cpu->neg.can_do_io = true;
+    ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
     /*
      * TODO: Delay swapping back to the read-write region of the TB
      * until we actually need to modify the TB.  The read-only copy,
@@ -554,9 +524,7 @@ static inline bool cpu_handle_exception(CPUState* cpu, int* ret)
 
     const TCGCPUOps* tcg_ops = cpu->cc->tcg_ops;
 
-    bql_lock();
     tcg_ops->do_interrupt(cpu);
-    bql_unlock();
     cpu->exception_index = -1;
 
     if (unlikely(cpu->singlestep_enabled)) {
@@ -584,7 +552,7 @@ void tcg_kick_vcpu_thread(CPUState* cpu)
     qatomic_store_release(&cpu->exit_request, true);
 
     /* Ensure cpu_exec will see the exit request after TCG has exited.  */
-    qatomic_store_release(&cpu->neg.icount_decr.u16.high, -1);
+    qatomic_store_release(&cpu->neg.tb_exit_request, true);
 }
 
 static inline bool cpu_handle_interrupt(CPUState* cpu, TranslationBlock** last_tb)
@@ -602,9 +570,16 @@ static inline bool cpu_handle_interrupt(CPUState* cpu, TranslationBlock** last_t
      * cpu->interrupt_request (see also store-release in
      * tcg_kick_vcpu_thread())
      */
-    qatomic_set_mb(&cpu->neg.icount_decr.u16.high, 0);
+    qatomic_set_mb(&cpu->neg.tb_exit_request, false);
 
     if (unlikely(cpu_test_interrupt(cpu, ~0))) {
+        /* EXITTB alone is an atomic clear and a local store. */
+        if (!cpu_test_interrupt(cpu, ~CPU_INTERRUPT_EXITTB)) {
+            cpu_reset_interrupt(cpu, CPU_INTERRUPT_EXITTB);
+            *last_tb = NULL;
+            goto check_exit_request;
+        }
+
         bql_lock();
         if (cpu_test_interrupt(cpu, CPU_INTERRUPT_DEBUG)) {
             cpu_reset_interrupt(cpu, CPU_INTERRUPT_DEBUG);
@@ -666,6 +641,7 @@ static inline bool cpu_handle_interrupt(CPUState* cpu, TranslationBlock** last_t
         bql_unlock();
     }
 
+check_exit_request:
     /*
      * Finally, check if we need to exit to the main loop.
      * The corresponding store-release is in cpu_exit.
@@ -697,7 +673,7 @@ static inline void cpu_loop_exec_tb(CPUState* cpu, TranslationBlock* tb, vaddr p
          * will also have set something else (eg exit_request or
          * interrupt_request) which will be handled by
          * cpu_handle_interrupt.  cpu_handle_interrupt will also
-         * clear cpu->icount_decr.u16.high.
+         * clear cpu->neg.tb_exit_request.
          */
         return;
     }
@@ -707,7 +683,7 @@ static inline void cpu_loop_exec_tb(CPUState* cpu, TranslationBlock* tb, vaddr p
 
 /* main execution loop */
 
-static int __attribute__((noinline)) cpu_exec_loop(CPUState* cpu, SyncClocks* sc)
+static int __attribute__((noinline)) cpu_exec_loop(CPUState* cpu)
 {
     int ret;
 
@@ -723,8 +699,8 @@ static int __attribute__((noinline)) cpu_exec_loop(CPUState* cpu, SyncClocks* sc
 
             /*
              * When requested, use an exact setting for cflags for the next
-             * execution.  This is used for icount, precise smc, and stop-
-             * after-access watchpoints.  Since this request should never
+             * execution.  This is used for precise smc and stop-after-access
+             * watchpoints.  Since this request should never
              * have CF_INVALID set, -1 is a convenient invalid value that
              * does not require tcg headers for cpu_common_reset.
              */
@@ -768,20 +744,18 @@ static int __attribute__((noinline)) cpu_exec_loop(CPUState* cpu, SyncClocks* sc
     return ret;
 }
 
-static int cpu_exec_setjmp(CPUState* cpu, SyncClocks* sc)
+static int cpu_exec_setjmp(CPUState* cpu)
 {
     /* Prepare setjmp context for exception handling. */
     if (unlikely(sigsetjmp(cpu->jmp_env, 0) != 0)) { cpu_exec_longjmp_cleanup(cpu); }
 
-    return cpu_exec_loop(cpu, sc);
+    return cpu_exec_loop(cpu);
 }
 
 int cpu_exec(CPUState* cpu)
 {
-    int        ret;
-    SyncClocks sc = {0};
+    int ret;
 
-    /* replay_interrupt may need current_cpu */
     current_cpu = cpu;
 
     if (cpu_handle_halt(cpu)) { return EXCP_HALTED; }
@@ -789,7 +763,7 @@ int cpu_exec(CPUState* cpu)
     RCU_READ_LOCK_GUARD();
     cpu_exec_enter(cpu);
 
-    ret = cpu_exec_setjmp(cpu, &sc);
+    ret = cpu_exec_setjmp(cpu);
 
     cpu_exec_exit(cpu);
     return ret;

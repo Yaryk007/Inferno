@@ -22,6 +22,7 @@
 #include "io/channel-null.h"
 #include "io/channel-watch.h"
 #include "qapi/error.h"
+#include "qemu/main-loop.h"
 #include "trace.h"
 #include "qemu/iov.h"
 
@@ -108,6 +109,8 @@ static gboolean qio_channel_null_source_check(GSource* source G_GNUC_UNUSED) { r
 
 static gboolean qio_channel_null_source_dispatch(GSource* source, GSourceFunc callback, gpointer user_data)
 {
+    BQL_LOCK_GUARD_SOURCE(source);
+
     QIOChannelFunc        func    = (QIOChannelFunc)callback;
     QIOChannelNullSource* ssource = (QIOChannelNullSource*)source;
 
@@ -153,14 +156,4 @@ static void qio_channel_null_class_init(ObjectClass* klass, const void* class_da
     ioc_klass->io_set_aio_fd_handler = qio_channel_null_set_aio_fd_handler;
 }
 
-static const TypeInfo qio_channel_null_info = {
-    .parent        = TYPE_QIO_CHANNEL,
-    .name          = TYPE_QIO_CHANNEL_NULL,
-    .instance_size = sizeof(QIOChannelNull),
-    .instance_init = qio_channel_null_init,
-    .class_init    = qio_channel_null_class_init,
-};
-
-static void qio_channel_null_register_types(void) { type_register_static(&qio_channel_null_info); }
-
-type_init(qio_channel_null_register_types);
+OBJECT_DEFINE_SIMPLE_TYPE_INSTANCE_INIT(QIOChannelNull, qio_channel_null, QIO_CHANNEL_NULL, QIO_CHANNEL)

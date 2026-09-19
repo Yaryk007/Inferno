@@ -60,7 +60,7 @@ struct AppleSMCClass
     ResettablePhases parent_phases;
 };
 
-struct AppleSMCState
+struct AppleSMC
 {
     AppleRTKit parent_obj;
 
@@ -75,7 +75,7 @@ struct AppleSMCState
     bool hold_reset;
 };
 
-SMCKey* apple_smc_get_key(AppleSMCState* s, uint32_t key)
+SMCKey* apple_smc_get_key(AppleSMC* s, uint32_t key)
 {
     SMCKey* key_entry;
 
@@ -86,7 +86,7 @@ SMCKey* apple_smc_get_key(AppleSMCState* s, uint32_t key)
     return NULL;
 }
 
-SMCKeyData* apple_smc_get_key_data(AppleSMCState* s, uint32_t key)
+SMCKeyData* apple_smc_get_key_data(AppleSMC* s, uint32_t key)
 {
     SMCKeyData* data_entry;
 
@@ -126,7 +126,7 @@ static SMCKey* apple_smc_new_key(uint32_t key, uint8_t size, SMCKeyType type, SM
     return key_entry;
 }
 
-static void apple_smc_insert_key(AppleSMCState* s, SMCKey* key_entry, SMCKeyData* data_entry)
+static void apple_smc_insert_key(AppleSMC* s, SMCKey* key_entry, SMCKeyData* data_entry)
 {
     if (apple_smc_get_key(s, key_entry->key) != NULL) {
         error_setg(&error_fatal, "duplicate SMC key `%c%c%c%c`", SMC_KEY_FORMAT(key_entry->key));
@@ -137,8 +137,7 @@ static void apple_smc_insert_key(AppleSMCState* s, SMCKey* key_entry, SMCKeyData
     QTAILQ_INSERT_TAIL(&s->key_data, data_entry, next);
 }
 
-void apple_smc_add_key(AppleSMCState* s, uint32_t key, uint8_t size, SMCKeyType type, SMCKeyAttribute attr,
-                       const void* data)
+void apple_smc_add_key(AppleSMC* s, uint32_t key, uint8_t size, SMCKeyType type, SMCKeyAttribute attr, const void* data)
 {
     SMCKey*     key_entry;
     SMCKeyData* data_entry;
@@ -150,7 +149,7 @@ void apple_smc_add_key(AppleSMCState* s, uint32_t key, uint8_t size, SMCKeyType 
     apple_smc_insert_key(s, key_entry, data_entry);
 }
 
-void apple_smc_add_sensor(AppleSMCState* s, uint32_t key, uint8_t size, SMCKeyType type, SMCKeyAttribute attr,
+void apple_smc_add_sensor(AppleSMC* s, uint32_t key, uint8_t size, SMCKeyType type, SMCKeyAttribute attr,
                           const void* data)
 {
     SMCKey*     key_entry;
@@ -164,7 +163,7 @@ void apple_smc_add_sensor(AppleSMCState* s, uint32_t key, uint8_t size, SMCKeyTy
     apple_smc_insert_key(s, key_entry, data_entry);
 }
 
-void apple_smc_add_key_func(AppleSMCState* s, uint32_t key, uint8_t size, SMCKeyType type, SMCKeyAttribute attr,
+void apple_smc_add_key_func(AppleSMC* s, uint32_t key, uint8_t size, SMCKeyType type, SMCKeyAttribute attr,
                             void* opaque, SMCKeyFunc* reader, SMCKeyFunc* writer)
 {
     SMCKey*     key_entry;
@@ -191,7 +190,7 @@ static SMCResult apple_smc_key_read(const SMCKey* key_entry, const SMCKeyData* d
     return SMC_RESULT_SUCCESS;
 }
 
-void apple_smc_send_hid_button(AppleSMCState* s, AppleSMCHIDButton button, bool state)
+void apple_smc_send_hid_button(AppleSMC* s, AppleSMCHIDButton button, bool state)
 {
     AppleRTKit* rtk = &s->parent_obj;
     KeyResponse r   = {0};
@@ -208,9 +207,9 @@ void apple_smc_send_hid_button(AppleSMCState* s, AppleSMCHIDButton button, bool 
 
 static SMCResult smc_key_count_read(SMCKey* key, SMCKeyData* data, const void* in, uint8_t in_length)
 {
-    AppleSMCState* s = key->opaque;
-    SMCKey*        cur;
-    uint32_t       key_count = 0;
+    AppleSMC* s = key->opaque;
+    SMCKey*   cur;
+    uint32_t  key_count = 0;
 
     QTAILQ_FOREACH (cur, &s->keys, next) { ++key_count; }
 
@@ -221,10 +220,10 @@ static SMCResult smc_key_count_read(SMCKey* key, SMCKeyData* data, const void* i
 
 static SMCResult apple_smc_mbse_write(SMCKey* key, SMCKeyData* data, const void* in, uint8_t in_length)
 {
-    AppleSMCState* s   = key->opaque;
-    AppleRTKit*    rtk = &s->parent_obj;
-    uint32_t       value;
-    KeyResponse    r = {0};
+    AppleSMC*   s   = key->opaque;
+    AppleRTKit* rtk = &s->parent_obj;
+    uint32_t    value;
+    KeyResponse r = {0};
 
     if (in == NULL || in_length != key->info.size) { return SMC_RESULT_BAD_ARGUMENT_ERROR; }
 
@@ -272,9 +271,9 @@ static SMCResult apple_smc_mbse_write(SMCKey* key, SMCKeyData* data, const void*
 
 static SMCResult apple_smc_sensor_count_read(SMCKey* key, SMCKeyData* data, const void* in, uint8_t in_length)
 {
-    AppleSMCState* s = key->opaque;
-    SMCKey*        cur;
-    uint32_t       count = 0;
+    AppleSMC* s = key->opaque;
+    SMCKey*   cur;
+    uint32_t  count = 0;
 
     QTAILQ_FOREACH (cur, &s->keys, next) {
         if (cur->is_sensor) { ++count; }
@@ -287,10 +286,10 @@ static SMCResult apple_smc_sensor_count_read(SMCKey* key, SMCKeyData* data, cons
 
 static SMCResult apple_smc_sensor_query_read(SMCKey* key, SMCKeyData* data, const void* in, uint8_t in_length)
 {
-    AppleSMCState* s = key->opaque;
-    uint32_t       queried_i;
-    SMCKey*        cur;
-    uint32_t       i = 0;
+    AppleSMC* s = key->opaque;
+    uint32_t  queried_i;
+    SMCKey*   cur;
+    uint32_t  i = 0;
 
     if (in == NULL || in_length != sizeof(uint32_t)) { return SMC_RESULT_BAD_ARGUMENT_ERROR; }
 
@@ -312,7 +311,7 @@ static SMCResult apple_smc_sensor_query_read(SMCKey* key, SMCKeyData* data, cons
 static void apple_smc_handle_key_endpoint(void* opaque, uint8_t ep, uint64_t msg)
 {
     AppleRTKit*       rtk = opaque;
-    AppleSMCState*    s   = opaque;
+    AppleSMC*         s   = opaque;
     const KeyMessage* kmsg;
     uint32_t          key;
     KeyResponse       resp = {0};
@@ -425,8 +424,8 @@ static const MemoryRegionOps ascv2_core_reg_ops = {
 
 static void apple_smc_boot_done(void* opaque)
 {
-    AppleSMCState* s = opaque;
-    s->is_booted     = true;
+    AppleSMC* s  = opaque;
+    s->is_booted = true;
 }
 
 static const AppleRTKitOps apple_smc_rtkit_ops = {
@@ -460,7 +459,7 @@ static uint32_t apple_smc_battery = 69;
  * The one SMC a machine has, kept for telling its guest that the battery
  * changed. Set as the device is created, by which time the main loop exists.
  */
-static AppleSMCState* apple_smc_instance;
+static AppleSMC* apple_smc_instance;
 
 /*
  * A power state notification. The guest answers sub-types 1, 3 and 6 alike, by
@@ -471,7 +470,7 @@ static AppleSMCState* apple_smc_instance;
 
 static void apple_smc_battery_changed(void* opaque)
 {
-    AppleSMCState* s = qatomic_read(&apple_smc_instance);
+    AppleSMC* s = qatomic_read(&apple_smc_instance);
     KeyResponse    r = {0};
 
     if (s == NULL || !s->is_booted) { return; }
@@ -554,7 +553,7 @@ static SMCResult apple_smc_battery_read(SMCKey* key, SMCKeyData* data, const voi
  * would mark it as a function in the attributes the guest can query, and the
  * battery driver has only ever seen these as plain keys.
  */
-static void apple_smc_add_live_key(AppleSMCState* s, uint32_t key, uint8_t size, SMCKeyType type,
+static void apple_smc_add_live_key(AppleSMC* s, uint32_t key, uint8_t size, SMCKeyType type,
                                    SMCKeyAttribute attr, SMCKeyFunc* reader)
 {
     SMCKey* key_entry;
@@ -614,21 +613,21 @@ static void apple_smc_set_battery_charging(Object* obj, bool value, Error** errp
 
 SysBusDevice* apple_smc_create(AppleDTNode* node, AppleA7IOPVersion version, uint64_t sram_size)
 {
-    DeviceState*   dev;
-    AppleSMCState* s;
-    AppleRTKit*    rtk;
-    SysBusDevice*  sbd;
-    AppleDTNode*   child;
-    AppleDTProp*   prop;
-    uint64_t*      reg;
-    uint8_t        data[8]                   = {0x40, 0x19, 0x01, 0x00, 0x80, 0x70, 0x00, 0x00};
-    uint8_t        ac_adapter_count          = 1;
-    int8_t         ac_w                      = 0x1;    // should actually be a function
-    uint8_t        batt_feature_flags        = 0x0;
-    uint16_t       batt_cycle_count          = 7;
-    uint16_t       batt_avg_time_to_full     = 0xffff;    // not charging
-    uint16_t       batt_max_capacity         = BATTERY_MAX_CAPACITY;
-    uint16_t       batt_full_charge_capacity = BATTERY_FULL_CHARGE_CAPACITY;
+    DeviceState*  dev;
+    AppleSMC*     s;
+    AppleRTKit*   rtk;
+    SysBusDevice* sbd;
+    AppleDTNode*  child;
+    AppleDTProp*  prop;
+    uint64_t*     reg;
+    uint8_t       data[8]                   = {0x40, 0x19, 0x01, 0x00, 0x80, 0x70, 0x00, 0x00};
+    uint8_t       ac_adapter_count          = 1;
+    int8_t        ac_w                      = 0x1;    // should actually be a function
+    uint8_t       batt_feature_flags        = 0x0;
+    uint16_t      batt_cycle_count          = 7;
+    uint16_t      batt_avg_time_to_full     = 0xffff;    // not charging
+    uint16_t      batt_max_capacity         = BATTERY_MAX_CAPACITY;
+    uint16_t      batt_full_charge_capacity = BATTERY_FULL_CHARGE_CAPACITY;
     uint32_t battery_fw_version      = 0x201;
     uint8_t  battery_count           = 1;
     uint16_t batt_cell_voltage       = 4200;
@@ -798,7 +797,7 @@ SysBusDevice* apple_smc_create(AppleDTNode* node, AppleA7IOPVersion version, uin
 static void apple_smc_reset_hold(Object* obj, ResetType type)
 {
     AppleRTKitClass* rtkc;
-    AppleSMCState*   s;
+    AppleSMC*        s;
 
     rtkc = APPLE_RTKIT_GET_CLASS(obj);
     s    = APPLE_SMC_IOP(obj);
@@ -847,14 +846,4 @@ static void apple_smc_class_init(ObjectClass* klass, const void* data)
     object_class_property_add_bool(klass, "hold-reset", apple_smc_get_hold_reset, apple_smc_set_hold_reset);
 }
 
-static const TypeInfo apple_smc_info = {
-    .name          = TYPE_APPLE_SMC_IOP,
-    .parent        = TYPE_APPLE_RTKIT,
-    .instance_size = sizeof(AppleSMCState),
-    .class_size    = sizeof(AppleSMCClass),
-    .class_init    = apple_smc_class_init,
-};
-
-static void apple_smc_register_types(void) { type_register_static(&apple_smc_info); }
-
-type_init(apple_smc_register_types);
+OBJECT_DEFINE_TYPE_CLASS_INIT(AppleSMC, apple_smc, APPLE_SMC_IOP, APPLE_RTKIT)

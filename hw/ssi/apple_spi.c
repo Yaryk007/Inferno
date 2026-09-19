@@ -133,7 +133,7 @@ static void apple_spi_update_xfer_tx(AppleSPIState* spi)
 
     uint32_t word_size = apple_spi_word_size(spi);
     uint32_t dma_len   = REG(spi, REG_TXCNT) * word_size;
-    uint32_t fifo_len  = fifo32_num_free(&spi->tx_fifo) * word_size;
+    uint64_t fifo_len  = (uint64_t)fifo32_num_free(&spi->tx_fifo) * word_size;
 
     dma_len = MIN(dma_len, dma_remaining);
     if (dma_len == 0) {
@@ -151,15 +151,15 @@ static void apple_spi_update_xfer_tx(AppleSPIState* spi)
 
     switch (word_size) {
         case sizeof(uint8_t):
-            for (uint32_t i = 0; i < dma_len; ++i) { fifo32_push(&spi->tx_fifo, buffer[i]); }
+            for (uint64_t i = 0; i < dma_len; ++i) { fifo32_push(&spi->tx_fifo, buffer[i]); }
             break;
         case sizeof(uint16_t):
-            for (uint32_t i = 0; i < dma_len; i += sizeof(uint16_t)) {
+            for (uint64_t i = 0; i < dma_len; i += sizeof(uint16_t)) {
                 fifo32_push(&spi->tx_fifo, lduw_le_p(&buffer[i]));
             }
             break;
         case sizeof(uint32_t):
-            for (uint32_t i = 0; i < dma_len; i += sizeof(uint32_t)) {
+            for (uint64_t i = 0; i < dma_len; i += sizeof(uint32_t)) {
                 fifo32_push(&spi->tx_fifo, ldl_le_p(&buffer[i]));
             }
             break;
@@ -177,7 +177,7 @@ static void apple_spi_flush_rx(AppleSPIState* spi)
     if (dma_remaining == 0) { return; }
 
     uint32_t word_size = apple_spi_word_size(spi);
-    uint64_t dma_len   = fifo32_num_used(&spi->rx_fifo) * word_size;
+    uint64_t dma_len   = (uint64_t)fifo32_num_used(&spi->rx_fifo) * word_size;
     dma_len            = MIN(dma_len, dma_remaining);
     if (dma_len == 0) { return; }
 
@@ -185,15 +185,15 @@ static void apple_spi_flush_rx(AppleSPIState* spi)
 
     switch (word_size) {
         case sizeof(uint8_t):
-            for (uint32_t i = 0; i < dma_len; ++i) { buffer[i] = fifo32_pop(&spi->rx_fifo); }
+            for (uint64_t i = 0; i < dma_len; ++i) { buffer[i] = fifo32_pop(&spi->rx_fifo); }
             break;
         case sizeof(uint16_t):
-            for (uint32_t i = 0; i < dma_len; i += sizeof(uint16_t)) {
+            for (uint64_t i = 0; i < dma_len; i += sizeof(uint16_t)) {
                 stw_le_p(buffer + i, fifo32_pop(&spi->rx_fifo));
             }
             break;
         case sizeof(uint32_t):
-            for (uint32_t i = 0; i < dma_len; i += sizeof(uint32_t)) {
+            for (uint64_t i = 0; i < dma_len; i += sizeof(uint32_t)) {
                 stl_le_p(buffer + i, fifo32_pop(&spi->rx_fifo));
             }
             break;
@@ -459,7 +459,7 @@ static void apple_spi_realize(DeviceState* dev, struct Error** errp)
 {
     AppleSPIState* spi = APPLE_SPI(dev);
     char           name[32];
-    AppleSIOState* sio;
+    AppleSIO*      sio;
 
     snprintf(name, sizeof(name), "%s.bus", dev->id);
     spi->ssi_bus = ssi_create_bus(dev, name);
@@ -468,6 +468,8 @@ static void apple_spi_realize(DeviceState* dev, struct Error** errp)
         snprintf(name, sizeof(name), "%s.mmio", dev->id);
         memory_region_init_io(&spi->iomem, OBJECT(dev), &apple_spi_reg_ops, spi, name, APPLE_SPI_MMIO_SIZE);
     }
+
+    memory_region_enable_lockless_io(&spi->iomem);
 
     sio = APPLE_SIO(object_property_get_link(OBJECT(dev), "sio", NULL));
 
@@ -507,7 +509,7 @@ SysBusDevice* apple_spi_from_node(AppleDTNode* node)
     return sbd;
 }
 
-static void apple_spi_instance_init(Object* obj)
+static void apple_spi_init(Object* obj)
 {
     AppleSPIState* spi = APPLE_SPI(obj);
     DeviceState*   dev = DEVICE(spi);
@@ -522,8 +524,6 @@ static void apple_spi_instance_init(Object* obj)
     fifo32_create(&spi->rx_fifo, REG_FIFO_DEPTH);
 
     qemu_mutex_init(&spi->lock);
-
-    memory_region_enable_lockless_io(&spi->iomem);
 }
 
 static void apple_spi_class_init(ObjectClass* klass, const void* data)
@@ -538,14 +538,4 @@ static void apple_spi_class_init(ObjectClass* klass, const void* data)
     dc->realize = apple_spi_realize;
 }
 
-static const TypeInfo apple_spi_type_info = {
-    .name          = TYPE_APPLE_SPI,
-    .parent        = TYPE_SYS_BUS_DEVICE,
-    .instance_size = sizeof(AppleSPIState),
-    .instance_init = apple_spi_instance_init,
-    .class_init    = apple_spi_class_init,
-};
-
-static void apple_spi_register_types(void) { type_register_static(&apple_spi_type_info); }
-
-type_init(apple_spi_register_types)
+OBJECT_DEFINE_SIMPLE_TYPE_INSTANCE_INIT(AppleSPIState, apple_spi, APPLE_SPI, SYS_BUS_DEVICE)

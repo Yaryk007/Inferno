@@ -21,6 +21,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/bswap.h"
+#include "qemu/main-loop.h"
 #include "io/channel-websock.h"
 #include "crypto/hash.h"
 #include "trace.h"
@@ -1058,6 +1059,8 @@ static gboolean qio_channel_websock_source_prepare(GSource* source, gint* timeou
 
 static gboolean qio_channel_websock_source_dispatch(GSource* source, GSourceFunc callback, gpointer user_data)
 {
+    BQL_LOCK_GUARD_SOURCE(source);
+
     QIOChannelFunc           func    = (QIOChannelFunc)callback;
     QIOChannelWebsockSource* wsource = (QIOChannelWebsockSource*)source;
 
@@ -1108,13 +1111,11 @@ static void qio_channel_websock_class_init(ObjectClass* klass, const void* class
 }
 
 static const TypeInfo qio_channel_websock_info = {
-    .parent            = TYPE_QIO_CHANNEL,
-    .name              = TYPE_QIO_CHANNEL_WEBSOCK,
-    .instance_size     = sizeof(QIOChannelWebsock),
+    .parent = TYPE_QIO_CHANNEL,
+    .name   = TYPE_QIO_CHANNEL_WEBSOCK,
+    OBJECT_TYPE_INSTANCE(QIOChannelWebsock),
     .instance_finalize = qio_channel_websock_finalize,
     .class_init        = qio_channel_websock_class_init,
 };
 
-static void qio_channel_websock_register_types(void) { type_register_static(&qio_channel_websock_info); }
-
-type_init(qio_channel_websock_register_types);
+DEFINE_TYPE(qio_channel_websock_info)

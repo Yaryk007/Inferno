@@ -318,13 +318,13 @@ static bool dwc3_bd_writeback(DWC3State* s, DWC3BufferDesc* desc, USBPacket* p, 
         // " is necessary outside of very special circumstances maybe skip over
         // the updates for short packets
 #if 0
-        assert_cmphex(0x10, ==, sizeof(trb->bp) + sizeof(trb->status) + sizeof(trb->ctrl));
+        qemu_build_assert(0x10 == sizeof(trb->bp) + sizeof(trb->status) + sizeof(trb->ctrl));
         if (dma_memory_write(desc->sgl.as, trb->addr + 0x0, &trb->bp, 0x10, MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
             qemu_log_mask(LOG_GUEST_ERROR, "%s: dma_memory_write trb->bp/status/ctrl failed\n", __func__);
         }
 #endif
 #if 1
-        assert_cmphex(0x8, ==, sizeof(trb->status) + sizeof(trb->ctrl));
+        qemu_build_assert(0x8 == sizeof(trb->status) + sizeof(trb->ctrl));
         if (dma_memory_write(desc->sgl.as, trb->addr + 0x8, &trb->status, 0x8, MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
             qemu_log_mask(LOG_GUEST_ERROR, "%s: dma_memory_write trb->status/ctrl failed\n", __func__);
         }
@@ -471,7 +471,7 @@ static bool dwc3_bd_writeback(DWC3State* s, DWC3BufferDesc* desc, USBPacket* p, 
                             event.endpoint_event = DEPEVT_XFERINPROGRESS;
                             dwc3_ep_trb_event(s, desc->epid, trb, event);
                             break;
-                        default: assert_not_reached(); break;
+                        default: assert_not_reached();
                     }
                 }
                 else {
@@ -2147,25 +2147,20 @@ static void usb_dwc3_class_init(ObjectClass* klass, const void* data)
     set_bit(DEVICE_CATEGORY_USB, dc->categories);
 }
 
-static const TypeInfo dwc3_usb_device_type_info = {
-    .name          = TYPE_DWC3_USB_DEVICE,
-    .parent        = TYPE_USB_DEVICE,
-    .instance_size = sizeof(DWC3DeviceState),
-    .class_init    = dwc3_usb_device_class_initfn,
+static const TypeInfo usb_dwc3_types[] = {
+    {
+        .name   = TYPE_DWC3_USB_DEVICE,
+        .parent = TYPE_USB_DEVICE,
+        OBJECT_TYPE_INSTANCE(DWC3DeviceState),
+        .class_init = dwc3_usb_device_class_initfn,
+    },
+    {
+        .name   = TYPE_DWC3_USB,
+        .parent = TYPE_SYS_BUS_DEVICE,
+        OBJECT_TYPE_INSTANCE(DWC3State),
+        .instance_init = usb_dwc3_init,
+        .class_init    = usb_dwc3_class_init,
+    },
 };
 
-static const TypeInfo usb_dwc3_info = {
-    .name          = TYPE_DWC3_USB,
-    .parent        = TYPE_SYS_BUS_DEVICE,
-    .instance_size = sizeof(DWC3State),
-    .instance_init = usb_dwc3_init,
-    .class_init    = usb_dwc3_class_init,
-};
-
-static void usb_dwc3_register_types(void)
-{
-    type_register_static(&dwc3_usb_device_type_info);
-    type_register_static(&usb_dwc3_info);
-}
-
-type_init(usb_dwc3_register_types)
+DEFINE_TYPES(usb_dwc3_types)

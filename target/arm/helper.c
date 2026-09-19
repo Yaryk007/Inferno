@@ -1291,7 +1291,7 @@ static CPAccessResult gt_stimer_access(CPUARMState* env, const ARMCPRegInfo* ri,
         case 0 :
         case 2 : return CP_ACCESS_UNDEFINED;
         case 3 : return CP_ACCESS_OK;
-        default: assert_not_reached();
+        default: qemu_build_not_reached();
     }
 }
 
@@ -1326,7 +1326,7 @@ static CPAccessResult gt_sel2timer_access(CPUARMState* env, const ARMCPRegInfo* 
             else {
                 return CP_ACCESS_UNDEFINED;
             }
-        default: assert_not_reached();
+        default: qemu_build_not_reached();
     }
 }
 
@@ -1405,7 +1405,7 @@ static uint64_t gt_indirect_access_timer_offset(CPUARMState* env, int timeridx)
         case GTIMER_HYPVIRT   :
         case GTIMER_S_EL2_PHYS:
         case GTIMER_S_EL2_VIRT: return 0;
-        default               : assert_not_reached();
+        default               : qemu_build_not_reached();
     }
 }
 
@@ -3641,15 +3641,8 @@ static void do_hcr_write(CPUARMState* env, uint64_t value, uint64_t valid_mask)
     }
 
     if (arm_feature(env, ARM_FEATURE_EL3)) { valid_mask &= ~HCR_HCD; }
-    else if (cpu->psci_conduit != QEMU_PSCI_CONDUIT_SMC) {
-        /*
-         * Architecturally HCR.TSC is RES0 if EL3 is not implemented.
-         * However, if we're using the SMC PSCI conduit then QEMU is
-         * effectively acting like EL3 firmware and so the guest at
-         * EL2 should retain the ability to prevent EL1 from being
-         * able to make SMC calls into the ersatz firmware, so in
-         * that case HCR.TSC should be read/write.
-         */
+    else {
+        /* HCR.TSC is RES0 if EL3 is not implemented. */
         valid_mask &= ~HCR_TSC;
     }
 
@@ -8292,7 +8285,7 @@ static void add_cpreg_to_hashtable(ARMCPU* cpu, const ARMCPRegInfo* r, void* opa
             if (cp == 0 || r->state == ARM_CP_STATE_BOTH) { cp = CP_REG_ARM64_SYSREG_CP; }
             key = ENCODE_AA64_CP_REG(cp, r->crn, crm, r->opc0, opc1, opc2);
             break;
-        default: assert_not_reached();
+        default: qemu_build_not_reached();
     }
 
     /* Overriding of an existing definition must be explicitly requested. */
@@ -9930,7 +9923,7 @@ static void arm_cpu_do_interrupt_aarch64(CPUState* cs)
 
 /*
  * Handle a CPU exception for A and R profile CPUs.
- * Do any appropriate logging, handle PSCI calls, and then hand off
+ * Do any appropriate logging, then hand off
  * to the AArch64-entry or AArch32-entry function depending on the
  * target exception level's register width.
  *
@@ -9951,19 +9944,6 @@ void arm_cpu_do_interrupt(CPUState* cs)
                       env->exception.syndrome);
     }
 
-    if (tcg_enabled() && arm_is_psci_call(cpu, cs->exception_index)) {
-        arm_handle_psci_call(cpu);
-        qemu_log_mask(CPU_LOG_INT, "...handled as PSCI call\n");
-        return;
-    }
-
-    /*
-     * Hooks may change global state so BQL should be held, also the
-     * BQL needs to be held for any modification of
-     * cs->interrupt_request.
-     */
-    assert(bql_locked());
-
     arm_call_pre_el_change_hook(cpu);
 
     assert(!excp_is_internal(cs->exception_index));
@@ -9974,7 +9954,7 @@ void arm_cpu_do_interrupt(CPUState* cs)
 
     arm_call_el_change_hook(cpu);
 
-    if (!kvm_enabled()) { cpu_set_interrupt(cs, CPU_INTERRUPT_EXITTB); }
+    if (tcg_enabled()) { cpu_set_interrupt(cs, CPU_INTERRUPT_EXITTB); }
 }
 
 uint64_t arm_sctlr(CPUARMState* env, int el)

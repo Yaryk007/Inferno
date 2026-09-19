@@ -23,6 +23,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "chardev/char.h"
 #include "io/channel-socket.h"
 #include "io/channel-websock.h"
@@ -381,7 +382,7 @@ static char* qemu_chr_socket_address(SocketChardev* s, const char* prefix)
             break;
         case SOCKET_ADDRESS_TYPE_VSOCK:
             return g_strdup_printf("%svsock:%s:%s", prefix, s->addr->u.vsock.cid, s->addr->u.vsock.port);
-        default: abort();
+        default: assert_not_reached();
     }
 }
 
@@ -1050,6 +1051,8 @@ static gboolean socket_reconnect_timeout(gpointer opaque)
     Chardev*       chr = CHARDEV(opaque);
     SocketChardev* s   = SOCKET_CHARDEV(opaque);
 
+    BQL_LOCK_GUARD_CONTEXT(chr->gcontext);
+
     qemu_mutex_lock(&chr->chr_write_lock);
     g_source_unref(s->reconnect_timer);
     s->reconnect_timer = NULL;
@@ -1393,9 +1396,9 @@ static void char_socket_class_init(ObjectClass* oc, const void* data)
 }
 
 static const TypeInfo char_socket_type_info = {
-    .name              = TYPE_CHARDEV_SOCKET,
-    .parent            = TYPE_CHARDEV,
-    .instance_size     = sizeof(SocketChardev),
+    .name   = TYPE_CHARDEV_SOCKET,
+    .parent = TYPE_CHARDEV,
+    OBJECT_TYPE_INSTANCE(SocketChardev),
     .instance_finalize = char_socket_finalize,
     .class_init        = char_socket_class_init,
 };

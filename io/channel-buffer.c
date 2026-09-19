@@ -21,6 +21,7 @@
 #include "qemu/osdep.h"
 #include "io/channel-buffer.h"
 #include "io/channel-watch.h"
+#include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "qemu/sockets.h"
 #include "trace.h"
@@ -145,6 +146,8 @@ static gboolean qio_channel_buffer_source_check(GSource* source)
 
 static gboolean qio_channel_buffer_source_dispatch(GSource* source, GSourceFunc callback, gpointer user_data)
 {
+    BQL_LOCK_GUARD_SOURCE(source);
+
     QIOChannelFunc          func    = (QIOChannelFunc)callback;
     QIOChannelBufferSource* bsource = (QIOChannelBufferSource*)source;
 
@@ -191,13 +194,11 @@ static void qio_channel_buffer_class_init(ObjectClass* klass, const void* class_
 }
 
 static const TypeInfo qio_channel_buffer_info = {
-    .parent            = TYPE_QIO_CHANNEL,
-    .name              = TYPE_QIO_CHANNEL_BUFFER,
-    .instance_size     = sizeof(QIOChannelBuffer),
+    .parent = TYPE_QIO_CHANNEL,
+    .name   = TYPE_QIO_CHANNEL_BUFFER,
+    OBJECT_TYPE_INSTANCE(QIOChannelBuffer),
     .instance_finalize = qio_channel_buffer_finalize,
     .class_init        = qio_channel_buffer_class_init,
 };
 
-static void qio_channel_buffer_register_types(void) { type_register_static(&qio_channel_buffer_info); }
-
-type_init(qio_channel_buffer_register_types);
+DEFINE_TYPE(qio_channel_buffer_info)

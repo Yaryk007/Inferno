@@ -107,7 +107,7 @@ enum ListenerDirection
                     if (_listener->_callback) { _listener->_callback(_listener, ##_args); } \
                 }                                                                           \
                 break;                                                                      \
-            default: abort();                                                               \
+            default: qemu_build_not_reached();                                              \
         }                                                                                   \
     }                                                                                       \
     while (0)
@@ -127,7 +127,7 @@ enum ListenerDirection
                     if (_listener->_callback) { _listener->_callback(_listener, _section, ##_args); } \
                 }                                                                                     \
                 break;                                                                                \
-            default: abort();                                                                         \
+            default: qemu_build_not_reached();                                                        \
         }                                                                                             \
     }                                                                                                 \
     while (0)
@@ -1211,7 +1211,10 @@ MemTxResult memory_region_dispatch_read(MemoryRegion* mr, hwaddr addr, uint64_t*
         return MEMTX_DECODE_ERROR;
     }
 
+    if (mr->lockless_io) { bql_lockless_section_begin(); }
     r = memory_region_dispatch_read1(mr, addr, pval, size, attrs);
+    if (mr->lockless_io) { bql_lockless_section_end(); }
+
     adjust_endianness(mr, pval, op);
     return r;
 }
@@ -1241,7 +1244,8 @@ static bool memory_region_dispatch_write_eventfds(MemoryRegion* mr, hwaddr addr,
 
 MemTxResult memory_region_dispatch_write(MemoryRegion* mr, hwaddr addr, uint64_t data, MemOp op, MemTxAttrs attrs)
 {
-    unsigned size = memop_size(op);
+    unsigned    size = memop_size(op);
+    MemTxResult r;
 
     if (mr->alias) { return memory_region_dispatch_write(mr->alias, mr->alias_offset + addr, data, op, attrs); }
     if (!memory_region_access_valid(mr, addr, size, true, attrs)) {
@@ -1257,15 +1261,18 @@ MemTxResult memory_region_dispatch_write(MemoryRegion* mr, hwaddr addr, uint64_t
      */
     if (!kvm_enabled() && memory_region_dispatch_write_eventfds(mr, addr, data, size, attrs)) { return MEMTX_OK; }
 
+    if (mr->lockless_io) { bql_lockless_section_begin(); }
     if (mr->ops->write) {
-        return access_with_adjusted_size(addr, &data, size, mr->ops->impl.min_access_size,
-                                         mr->ops->impl.max_access_size, memory_region_write_accessor, mr, attrs);
+        r = access_with_adjusted_size(addr, &data, size, mr->ops->impl.min_access_size, mr->ops->impl.max_access_size,
+                                      memory_region_write_accessor, mr, attrs);
     }
     else {
-        return access_with_adjusted_size(addr, &data, size, mr->ops->impl.min_access_size,
-                                         mr->ops->impl.max_access_size, memory_region_write_with_attrs_accessor, mr,
-                                         attrs);
+        r = access_with_adjusted_size(addr, &data, size, mr->ops->impl.min_access_size, mr->ops->impl.max_access_size,
+                                      memory_region_write_with_attrs_accessor, mr, attrs);
     }
+    if (mr->lockless_io) { bql_lockless_section_end(); }
+
+    return r;
 }
 
 static void memory_region_set_ops(MemoryRegion* mr, const MemoryRegionOps* ops, void* opaque)
@@ -2894,35 +2901,28 @@ bool memory_region_init_rom_device(MemoryRegion* mr, Object* owner, const Memory
     return false;
 }
 
-static const TypeInfo memory_region_info = {
-    .parent            = TYPE_OBJECT,
-    .name              = TYPE_MEMORY_REGION,
-    .class_size        = sizeof(MemoryRegionClass),
-    .instance_size     = sizeof(MemoryRegion),
-    .instance_init     = memory_region_initfn,
-    .instance_finalize = memory_region_finalize,
+static const TypeInfo memory_types[] = {
+    {
+        .parent     = TYPE_OBJECT,
+        .name       = TYPE_MEMORY_REGION,
+        .class_size = sizeof(MemoryRegionClass),
+        OBJECT_TYPE_INSTANCE(MemoryRegion),
+        .instance_init     = memory_region_initfn,
+        .instance_finalize = memory_region_finalize,
+    },
+    {
+        .parent     = TYPE_MEMORY_REGION,
+        .name       = TYPE_IOMMU_MEMORY_REGION,
+        .class_size = sizeof(IOMMUMemoryRegionClass),
+        OBJECT_TYPE_INSTANCE(IOMMUMemoryRegion),
+        .instance_init = iommu_memory_region_initfn,
+        .abstract      = true,
+    },
+    {
+        .parent     = TYPE_INTERFACE,
+        .name       = TYPE_RAM_DISCARD_MANAGER,
+        .class_size = sizeof(RamDiscardManagerClass),
+    },
 };
 
-static const TypeInfo iommu_memory_region_info = {
-    .parent        = TYPE_MEMORY_REGION,
-    .name          = TYPE_IOMMU_MEMORY_REGION,
-    .class_size    = sizeof(IOMMUMemoryRegionClass),
-    .instance_size = sizeof(IOMMUMemoryRegion),
-    .instance_init = iommu_memory_region_initfn,
-    .abstract      = true,
-};
-
-static const TypeInfo ram_discard_manager_info = {
-    .parent     = TYPE_INTERFACE,
-    .name       = TYPE_RAM_DISCARD_MANAGER,
-    .class_size = sizeof(RamDiscardManagerClass),
-};
-
-static void memory_register_types(void)
-{
-    type_register_static(&memory_region_info);
-    type_register_static(&iommu_memory_region_info);
-    type_register_static(&ram_discard_manager_info);
-}
-
-type_init(memory_register_types)
+DEFINE_TYPES(memory_types)

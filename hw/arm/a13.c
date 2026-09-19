@@ -108,7 +108,7 @@ static QEMUTimer* ipicr_timer = NULL;
 
 bool apple_a13_is_asleep(const AppleA13State* acpu) { return CPU(acpu)->halted; }
 
-bool apple_a13_is_off(const AppleA13State* acpu) { return acpu->parent_obj.power_state == PSCI_OFF; }
+bool apple_a13_is_off(const AppleA13State* acpu) { return acpu->parent_obj.power_state == ARM_POWER_OFF; }
 
 void apple_a13_set_on(AppleA13State* acpu)
 {
@@ -134,7 +134,7 @@ void apple_a13_set_off(AppleA13State* acpu)
 {
     int ret = QEMU_ARM_POWERCTL_RET_SUCCESS;
 
-    if (acpu->parent_obj.power_state != PSCI_OFF) { ret = arm_set_cpu_off(acpu->parent_obj.mp_affinity); }
+    if (acpu->parent_obj.power_state != ARM_POWER_OFF) { ret = arm_set_cpu_off(acpu->parent_obj.mp_affinity); }
 
     if (ret != QEMU_ARM_POWERCTL_RET_SUCCESS) {
         error_report("%s: failed to turn off CPU %d: err %d", __func__, acpu->cpu_id, ret);
@@ -641,27 +641,22 @@ static void apple_a13_cluster_class_init(ObjectClass* klass, const void* data)
     device_class_set_props(dc, apple_a13_cluster_properties);
 }
 
-static const TypeInfo apple_a13_info = {
-    .name          = TYPE_APPLE_A13,
-    .parent        = ARM_CPU_TYPE_NAME("apple-gxf"),
-    .instance_size = sizeof(AppleA13State),
-    .instance_init = apple_a13_instance_init,
-    .class_size    = sizeof(AppleA13Class),
-    .class_init    = apple_a13_class_init,
+static const TypeInfo apple_a13_types[] = {
+    {
+        .name   = TYPE_APPLE_A13,
+        .parent = ARM_CPU_TYPE_NAME("apple-gxf"),
+        OBJECT_TYPE_INSTANCE(AppleA13State),
+        .instance_init = apple_a13_instance_init,
+        .class_size    = sizeof(AppleA13Class),
+        .class_init    = apple_a13_class_init,
+    },
+    {
+        .name   = TYPE_APPLE_A13_CLUSTER,
+        .parent = TYPE_CPU_CLUSTER,
+        OBJECT_TYPE_INSTANCE(AppleA13Cluster),
+        .instance_init = apple_a13_cluster_instance_init,
+        .class_init    = apple_a13_cluster_class_init,
+    },
 };
 
-static const TypeInfo apple_a13_cluster_info = {
-    .name          = TYPE_APPLE_A13_CLUSTER,
-    .parent        = TYPE_CPU_CLUSTER,
-    .instance_size = sizeof(AppleA13Cluster),
-    .instance_init = apple_a13_cluster_instance_init,
-    .class_init    = apple_a13_cluster_class_init,
-};
-
-static void apple_a13_register_types(void)
-{
-    type_register_static(&apple_a13_info);
-    type_register_static(&apple_a13_cluster_info);
-}
-
-type_init(apple_a13_register_types);
+DEFINE_TYPES(apple_a13_types)

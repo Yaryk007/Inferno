@@ -1107,7 +1107,7 @@ static void dwc2_device_process_packet(DWC2State* s, USBPacket* p)
                         case D0EPCTL_MPS_32: mps = 32; break;
                         case D0EPCTL_MPS_16: mps = 16; break;
                         case D0EPCTL_MPS_8 : mps = 8; break;
-                        default            : assert_not_reached(); break;
+                        default            : qemu_build_not_reached(); break;
                     }
                 }
                 else {
@@ -1253,7 +1253,7 @@ static void dwc2_device_process_packet(DWC2State* s, USBPacket* p)
                         case D0EPCTL_MPS_32: mps = 32; break;
                         case D0EPCTL_MPS_16: mps = 16; break;
                         case D0EPCTL_MPS_8 : mps = 8; break;
-                        default            : assert_not_reached(); break;
+                        default            : qemu_build_not_reached(); break;
                     }
                 }
                 else {
@@ -2143,25 +2143,20 @@ static void dwc2_class_init(ObjectClass* klass, const void* data)
     device_class_set_props(dc, dwc2_usb_properties);
 }
 
-static const TypeInfo dwc2_usb_device_type_info = {
-    .name          = TYPE_DWC2_USB_DEVICE,
-    .parent        = TYPE_USB_DEVICE,
-    .instance_size = sizeof(DWC2DeviceState),
-    .class_init    = dwc2_usb_device_class_initfn_common,
+static const TypeInfo dwc2_usb_types[] = {
+    {
+        .name   = TYPE_DWC2_USB_DEVICE,
+        .parent = TYPE_USB_DEVICE,
+        OBJECT_TYPE_INSTANCE(DWC2DeviceState),
+        .class_init = dwc2_usb_device_class_initfn_common,
+    },
+    {
+        .name   = TYPE_DWC2_USB,
+        .parent = TYPE_SYS_BUS_DEVICE,
+        OBJECT_TYPE_INSTANCE(DWC2State),
+        .instance_init = dwc2_init,
+        .class_init    = dwc2_class_init,
+    },
 };
 
-static const TypeInfo dwc2_usb_type_info = {
-    .name          = TYPE_DWC2_USB,
-    .parent        = TYPE_SYS_BUS_DEVICE,
-    .instance_size = sizeof(DWC2State),
-    .instance_init = dwc2_init,
-    .class_init    = dwc2_class_init,
-};
-
-static void dwc2_usb_register_types(void)
-{
-    type_register_static(&dwc2_usb_device_type_info);
-    type_register_static(&dwc2_usb_type_info);
-}
-
-type_init(dwc2_usb_register_types)
+DEFINE_TYPES(dwc2_usb_types)

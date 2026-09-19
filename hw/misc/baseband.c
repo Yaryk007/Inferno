@@ -238,7 +238,7 @@ static void baseband_gpio_set_reset_det(DeviceState* dev, int level)
 static void apple_baseband_add_pcie_cap_hmap(AppleBasebandDeviceState* s, PCIDevice* dev)
 {
     DPRINTF("%s: pci_is_express: %d\n", __func__, pci_is_express(dev));
-    assert_cmpuint(sizeof(s->hmap), ==, 0x70);
+    qemu_build_assert(sizeof(s->hmap) == 0x70);
     s->hmap         = (custom_hmap_t){0};
     s->hmap.vsec_id = 0x24;
     pcie_add_capability(dev, PCI_EXT_CAP_ID_VNDR, 0x0, s->hmap_hardcoded_offset, sizeof(s->hmap));
@@ -865,7 +865,7 @@ SysBusDevice* apple_baseband_create(AppleDTNode* node, PCIBus* pci_bus, ApplePCI
     object_property_add_child(OBJECT(s), "device", OBJECT(s->device));
 
     // smc-pmu
-    AppleSMCState* smc = APPLE_SMC_IOP(object_property_get_link(OBJECT(qdev_get_machine()), "smc", &error_fatal));
+    AppleSMC* smc = APPLE_SMC_IOP(object_property_get_link(OBJECT(qdev_get_machine()), "smc", &error_fatal));
     apple_smc_add_key_func(smc, 'gP07', 4, SMC_KEY_TYPE_UINT32, SMC_ATTR_LE | SMC_ATTR_UNK_0x20, s, smc_key_gP07_read,
                            smc_key_gP07_write);
     apple_smc_add_key_func(smc, 'gP09', 4, SMC_KEY_TYPE_UINT32, SMC_ATTR_LE | SMC_ATTR_UNK_0x20, s, smc_key_gP09_read,
@@ -1015,8 +1015,8 @@ static void apple_baseband_device_qdev_reset_hold(Object* obj, ResetType type)
         s->image_ptr = NULL;
     }
     s->baseband_context0 = (baseband_context0_t){0};
-    assert_cmpuint(sizeof(s->baseband_context0), ==, 0x68);
-    assert_cmpuint(sizeof(custom_baseband0_t), ==, 60);
+    qemu_build_assert(sizeof(s->baseband_context0) == 0x68);
+    qemu_build_assert(sizeof(custom_baseband0_t) == 60);
 
     // TODO: pcie_cap_slot_reset can and will silently revert
     // set_power/set_enable when it's being done here
@@ -1085,17 +1085,17 @@ static void apple_baseband_class_init(ObjectClass* klass, const void* data)
 
 static const TypeInfo apple_baseband_types[] = {
     {
-        .name          = TYPE_APPLE_BASEBAND_DEVICE,
-        .parent        = TYPE_PCI_DEVICE,
-        .instance_size = sizeof(AppleBasebandDeviceState),
-        .class_init    = apple_baseband_device_class_init,
-        .interfaces    = (InterfaceInfo[]){{INTERFACE_PCIE_DEVICE}, {}},
+        .name   = TYPE_APPLE_BASEBAND_DEVICE,
+        .parent = TYPE_PCI_DEVICE,
+        OBJECT_TYPE_INSTANCE(AppleBasebandDeviceState),
+        .class_init = apple_baseband_device_class_init,
+        .interfaces = (InterfaceInfo[]){{INTERFACE_PCIE_DEVICE}, {}},
     },
     {
-        .name          = TYPE_APPLE_BASEBAND,
-        .parent        = TYPE_SYS_BUS_DEVICE,
-        .instance_size = sizeof(AppleBasebandState),
-        .class_init    = apple_baseband_class_init,
+        .name   = TYPE_APPLE_BASEBAND,
+        .parent = TYPE_SYS_BUS_DEVICE,
+        OBJECT_TYPE_INSTANCE(AppleBasebandState),
+        .class_init = apple_baseband_class_init,
     },
 };
 

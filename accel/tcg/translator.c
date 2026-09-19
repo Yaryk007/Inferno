@@ -19,12 +19,6 @@
 #include "internal-common.h"
 #include "tb-internal.h"
 
-static void set_can_do_io(DisasContextBase* db, bool val)
-{
-    QEMU_BUILD_BUG_ON(sizeof_field(CPUState, neg.can_do_io) != 1);
-    tcg_gen_st8_i32(tcg_constant_i32(val), tcg_env, offsetof(CPUState, neg.can_do_io) - sizeof(CPUState));
-}
-
 bool translator_io_start(DisasContextBase* db)
 {
     /*
@@ -37,24 +31,22 @@ bool translator_io_start(DisasContextBase* db)
 
 static void gen_tb_start(DisasContextBase* db, uint32_t cflags)
 {
-    TCGv_i32 count = NULL;
+    TCGv_i32 req = NULL;
 
     if (!(cflags & CF_NOIRQ)) {
-        count = tcg_temp_new_i32();
-        tcg_gen_ld_i32(count, tcg_env, offsetof(CPUState, neg.icount_decr.u32) - sizeof(CPUState));
+        QEMU_BUILD_BUG_ON(sizeof_field(CPUState, neg.tb_exit_request) != 1);
+        req = tcg_temp_new_i32();
+        tcg_gen_ld8u_i32(req, tcg_env, offsetof(CPUState, neg.tb_exit_request) - sizeof(CPUState));
     }
 
     /*
-     * Emit the check against icount_decr.u32 to see if we should exit
-     * unless we suppress the check with CF_NOIRQ. If we are using
-     * icount and have suppressed interruption the higher level code
-     * should have ensured we don't run more instructions than the
-     * budget.
+     * Emit the check against tb_exit_request to see if we should exit,
+     * unless we suppress the check with CF_NOIRQ.
      */
     if (cflags & CF_NOIRQ) { tcg_ctx->exitreq_label = NULL; }
     else {
         tcg_ctx->exitreq_label = gen_new_label();
-        tcg_gen_brcondi_i32(TCG_COND_LT, count, 0, tcg_ctx->exitreq_label);
+        tcg_gen_brcondi_i32(TCG_COND_NE, req, 0, tcg_ctx->exitreq_label);
     }
 }
 
@@ -136,20 +128,6 @@ void translator_loop(CPUState* cpu, TranslationBlock* tb, int* max_insns, vaddr 
     /* Emit code to exit the TB, as indicated by db->is_jmp.  */
     ops->tb_stop(db, cpu);
     gen_tb_end(tb, cflags, db->num_insns);
-
-    /*
-     * Manage can_do_io for the translation block: set to false before
-     * the first insn and set to true before the last insn.
-     */
-    if (db->num_insns == 1) { tcg_debug_assert(first_insn_start == db->insn_start); }
-    else {
-        tcg_debug_assert(first_insn_start != db->insn_start);
-        tcg_ctx->emit_before_op = first_insn_start;
-        set_can_do_io(db, false);
-    }
-    tcg_ctx->emit_before_op = db->insn_start;
-    set_can_do_io(db, true);
-    tcg_ctx->emit_before_op = NULL;
 
     /* May be used by disas_log. */
     tb->size   = db->pc_next - db->pc_first;

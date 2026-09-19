@@ -256,6 +256,33 @@ AioContext* iohandler_get_aio_context(void);
 bool bql_locked(void);
 
 /**
+ * bql_lockless_section_begin: Enter a section that must not take the BQL
+ * bql_lockless_section_end: Leave it again
+ *
+ * Marks the thread as running code required to be BQL free, such as a
+ * lockless IO memory region handler. bql_lock() asserts against it.
+ * Sections nest.
+ */
+void bql_lockless_section_begin(void);
+void bql_lockless_section_end(void);
+
+/**
+ * BQL_LOCK_GUARD_SOURCE: take the BQL if @src is dispatched by the main loop
+ *
+ * GSource callbacks on the default context run under the BQL. The same source
+ * types are also used from IOThreads, whose callbacks must not take it.
+ */
+#define BQL_LOCK_GUARD_SOURCE(src) BQL_LOCK_GUARD_IF(g_source_get_context(src) == g_main_context_default())
+
+/**
+ * BQL_LOCK_GUARD_CONTEXT: take the BQL if @ctx is the main loop's context
+ *
+ * For callbacks that know the context they were attached to rather than the
+ * GSource. A NULL context means the default one.
+ */
+#define BQL_LOCK_GUARD_CONTEXT(ctx) BQL_LOCK_GUARD_IF((ctx) == NULL || (ctx) == g_main_context_default())
+
+/**
  * qemu_in_main_thread: return whether it's possible to safely access
  * the global state of the block layer.
  *

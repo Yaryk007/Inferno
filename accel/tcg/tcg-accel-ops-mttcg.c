@@ -84,6 +84,16 @@ static void mttcg_force_rcu(Notifier* notify, void* data)
  * current CPUState for a given thread.
  */
 
+/* Whether anything the outer loop handles under the BQL is pending. */
+static bool mttcg_exit_needs_bql(CPUState* cpu, int r)
+{
+    if (r == EXCP_DEBUG || r == EXCP_ATOMIC) { return true; }
+    if (qatomic_read(&cpu->stop) || qatomic_read(&cpu->unplug)) { return true; }
+    if (!cpu_work_list_empty(cpu)) { return true; }
+
+    return cpu_thread_is_idle(cpu);
+}
+
 static void* mttcg_cpu_thread_fn(void* arg)
 {
     MttcgForceRcuNotifier force_rcu;
@@ -104,19 +114,25 @@ static void* mttcg_cpu_thread_fn(void* arg)
     bql_lock();
     qemu_thread_get_self(cpu->thread);
 
-    cpu->thread_id     = qemu_get_thread_id();
-    cpu->neg.can_do_io = true;
-    current_cpu        = cpu;
+    cpu->thread_id = qemu_get_thread_id();
+    current_cpu    = cpu;
     cpu_thread_signal_created(cpu);
     qemu_guest_random_seed_thread_part2(cpu->random_seed);
 
+    /* Outer vCPU loop: handles CPU events, runs under the BQL. */
     do {
         qemu_process_cpu_events(cpu);
 
         if (cpu_can_run(cpu)) {
             int r;
             bql_unlock();
-            r = tcg_cpu_exec(cpu);
+
+            do {
+                r = tcg_cpu_exec(cpu);
+                qatomic_set(&cpu->exit_request, false);
+            }
+            while (!mttcg_exit_needs_bql(cpu, r));
+
             bql_lock();
             switch (r) {
                 case EXCP_DEBUG: cpu_handle_guest_debug(cpu); break;
