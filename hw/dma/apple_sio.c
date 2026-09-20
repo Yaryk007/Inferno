@@ -214,7 +214,7 @@ static void apple_sio_dma_del_buffers(AppleSIODMAEndpoint* ep)
     QTAILQ_FOREACH_SAFE (buf, &ep->buffers, next, buf_next) { apple_sio_dma_destroy_buffer(ep, buf); }
 }
 
-static void apple_sio_dma_writeback(AppleSIOState* s, AppleSIODMAEndpoint* ep, SIODMABuffer* buf);
+static void apple_sio_dma_writeback(AppleSIO* s, AppleSIODMAEndpoint* ep, SIODMABuffer* buf);
 
 // -- internal references --
 // Firestorm$Inferno/18A5351d/sio.bndb@000030e4{sio_endpoint::handle_message}+0x64

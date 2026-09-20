@@ -2288,7 +2288,7 @@ static void t8030_audio_drain(void* opaque)
     // behind it is in an uninterruptible wait. Naming the channel is the only way to find out which
     // port that is.
     if (getenv("INFERNO_AUDIO_DMA_TRACE") != NULL && ++drain->ticks % 200 == 0) {
-        AppleSIOState* sio = APPLE_SIO(object_property_get_link(OBJECT(qdev_get_machine()), "sio", &error_fatal));
+        AppleSIO* sio = APPLE_SIO(object_property_get_link(OBJECT(qdev_get_machine()), "sio", &error_fatal));
         int            ch;
 
         for (ch = 0; ch < 0xDC; ch++) {
@@ -2307,7 +2307,7 @@ static void t8030_audio_drain(void* opaque)
 
 static void t8030_create_audio_drain(AppleT8030MachineState* t8030)
 {
-    AppleSIOState*       sio;
+    AppleSIO*       sio;
     T8030AudioDrain*     drain;
     AppleSIODMAEndpoint* skip_tx;
     AppleSIODMAEndpoint* skip_rx;
