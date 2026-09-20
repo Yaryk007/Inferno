@@ -260,6 +260,23 @@ static void ck_kp_apfs_patches(CKPatcherRange* range)
     ck_patcher_find_replace(range, "allow rooting the live fs of a sealed volume", live_sealed_pattern,
                             live_sealed_mask, sizeof(live_sealed_pattern), sizeof(uint32_t), live_sealed_repl, NULL, 4,
                             sizeof(live_sealed_repl));
+
+    // A live-editable System volume (see above) is not just unsealed at mount --
+    // authapfs later notices its content no longer matches the seal's own
+    // record and panics ("root volume seal is broken" @authapfs.c:678). Same
+    // idea as the mount-time check: drop the `tbnz` that gates the panic so a
+    // volume edited after restore boots anyway, the way a development kernel
+    // would.
+    static const uint8_t seal_broken_pattern[] = {
+        0x00, 0x00, 0x00, 0x94,    // bl <query the seal's own recorded state>
+        0x00, 0x00, 0x70, 0x37,    // tbnz w0, #0xE, <panic: root volume seal is broken>
+    };
+    static const uint8_t seal_broken_mask[] = {0x00, 0x00, 0x00, 0xFC, 0x1F, 0x00, 0xF8, 0xFF};
+    QEMU_BUILD_BUG_ON(sizeof(seal_broken_pattern) != sizeof(seal_broken_mask));
+    static const uint8_t seal_broken_repl[] = {NOP_BYTES};
+    ck_patcher_find_replace(range, "root volume seal is broken -- allow it anyway", seal_broken_pattern,
+                            seal_broken_mask, sizeof(seal_broken_pattern), sizeof(uint32_t), seal_broken_repl, NULL, 4,
+                            sizeof(seal_broken_repl));
 }
 
 static bool ck_kp_tc_callback(void* ctx, uint8_t* buffer)
@@ -695,6 +712,58 @@ static void ck_kp_pmap_cs_enforce_patch(CKPatcherRange* range)
                              ck_kp_pmap_cs_enforce_callback);
 }
 
+/*
+ * `tbz w0, #0, ?` right after a `bl` -- reading a bit out of whatever the
+ * call just returned in w0. The `bl` itself is not matched here: its
+ * encoding is a call-site-relative displacement, so the same logical call
+ * looks like different bytes at each of the several places that make it,
+ * where the `tbz` immediately following is only ever this one shape. `bl`
+ * is a fixed six-bit opcode class regardless of displacement, so checking
+ * for one there (rather than requiring the exact call) is what lets one
+ * pattern reach every occurrence.
+ */
+static bool ck_kp_skip_guarded_nonce_check_callback(void* ctx, uint8_t* buffer)
+{
+    if ((ldl_le_p(buffer - sizeof(uint32_t)) & 0xFC000000) != 0x94000000) { return false; }
+    stl_le_p(buffer, NOP);
+    return true;
+}
+
+/*
+ * In AppleImage4, before certain nonce operations, the kernel asks "does
+ * this one need guarded execution" and, if yes, "am I actually in it right
+ * now" -- and panics ("must execute in guarded mode: ...") if the second
+ * answer is no. With every path into GXF closed off
+ * (`ck_kp_force_non_gxf_exception_entry`, below in `ck_patch_virt`), that
+ * second answer is now always no, so any caller that needed the first check
+ * to say yes hits this every time. It is not one call site: the same pair of
+ * checks guards several distinct nonce operations, each inlined on its own,
+ * so this keeps patching matches until a pass finds none left rather than
+ * stopping after the first.
+ *
+ * Both checks are shared helpers, likely called from elsewhere for reasons
+ * that still need guarding, so neither is neutered globally -- only each
+ * matched branch to a panic is turned into a fall-through, same as the
+ * guest's own hardware would fall through if the first check had said no.
+ * There is no real key behind these nonces in an emulator with a software
+ * SEP already standing in for the whole chain of trust; the invariant they
+ * guard is moot here.
+ */
+static void ck_kp_skip_guarded_nonce_check(CKPatcherRange* range)
+{
+    static const uint8_t pattern[] = {0x00, 0x00, 0x00, 0x36};    // tbz w0, #0, ?
+    static const uint8_t mask[]    = {0x5F, 0xF8, 0xFF, 0xFF};
+    QEMU_BUILD_BUG_ON(sizeof(pattern) != sizeof(mask));
+
+    for (int found = 0; found < 32; ++found) {
+        if (!ck_patcher_find_callback(range, "skip a guarded-mode nonce panic (no real key behind it here)", pattern,
+                                      mask, sizeof(pattern), sizeof(uint32_t), ck_kp_skip_guarded_nonce_check_callback))
+        {
+            break;
+        }
+    }
+}
+
 void ck_patch_kernel(MachoHeader64* hdr)
 {
     MachoHeader64*             apfs_hdr;
@@ -722,6 +791,7 @@ void ck_patch_kernel(MachoHeader64* hdr)
 
     img4_text = ck_kp_find_image_text(hdr, "com.apple.security.AppleImage4");
     ck_kp_img4_patches(img4_text);
+    ck_kp_skip_guarded_nonce_check(img4_text);
 
     kernel_text = ck_kp_get_kernel_section(hdr, "__TEXT_EXEC", "__text");
     ck_kp_mac_mount_patch(kernel_text);
@@ -865,6 +935,57 @@ static void ck_kp_disable_ppl(CKPatcherRange* range)
     }
 }
 
+/*
+ * Turns a matched `cbz`/`cbnz` into an unconditional `b` to the exact same
+ * target, decoded from the instruction's own imm19 rather than assumed --
+ * the only thing that changes is which of the two encodings computes the
+ * branch, so this generalises beyond one specific offset.
+ */
+static bool ck_kp_force_branch_callback(void* ctx, uint8_t* buffer)
+{
+    uint32_t insn   = ldl_le_p(buffer);
+    int32_t  imm19  = (int32_t)((insn >> 5) & 0x7FFFF);
+    if (imm19 & 0x40000) { imm19 |= ~0x7FFFF; }    // sign-extend
+
+    uint32_t b_insn = (0x5U << 26) | (((uint32_t)imm19) & 0x3FFFFFF);
+    stl_le_p(buffer, b_insn);
+    return true;
+}
+
+/*
+ * The lower-EL synchronous exception handler checks a global (set at boot if
+ * the CPU claims GXF support) and, if set, enters guarded execution with
+ * GENTER before dispatching the exception. Under HVF that GENTER traps as an
+ * undefined instruction -- Hypervisor.framework never exposes GXF to a
+ * guest at all, so this is not a register the emulator can satisfy by
+ * getting some sysreg write right; the guest has to be kept off that path
+ * entirely.
+ *
+ * The branch this patches always exists regardless of whether the global is
+ * set -- it decides which of the two paths to take. Forcing it unconditional
+ * routes every synchronous exception through the ordinary (non-GXF) dispatch
+ * table, which is what already runs on any CPU that doesn't claim GXF. That
+ * path is a complete handler on its own, not a fallback missing pieces of
+ * the other one.
+ *
+ * Anchor: the branch's target (an `mrs` of an Apple-private GXF status
+ * register found nowhere else) makes the two instructions together unique in
+ * __TEXT_EXEC, so only the branch itself is rewritten and everything after
+ * it, including that `mrs`, is left as found.
+ */
+static void ck_kp_force_non_gxf_exception_entry(CKPatcherRange* range)
+{
+    static const uint8_t pattern[] = {
+        0x00, 0x00, 0x00, 0x34,    // cbz w?, ?
+        0x00, 0xF8, 0x3E, 0xD5,    // mrs x?, s3_6_c15_c8_0
+    };
+    static const uint8_t mask[] = {0x00, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0xFF, 0xFF};
+    QEMU_BUILD_BUG_ON(sizeof(pattern) != sizeof(mask));
+
+    ck_patcher_find_callback(range, "force the non-GXF exception path (HVF has no GENTER)", pattern, mask,
+                             sizeof(pattern), sizeof(uint32_t), ck_kp_force_branch_callback);
+}
+
 void ck_patch_virt(MachoHeader64* hdr, const bool enable_pac)
 {
     g_autofree CKPatcherRange* kernel_text    = NULL;
@@ -882,4 +1003,5 @@ void ck_patch_virt(MachoHeader64* hdr, const bool enable_pac)
     ck_kp_virt_jop_toggle_patch(kernel_ppltext == NULL ? kernel_text : kernel_ppltext);
 
     ck_kp_disable_ppl(kernel_text);
+    ck_kp_force_non_gxf_exception_entry(kernel_text);
 }
