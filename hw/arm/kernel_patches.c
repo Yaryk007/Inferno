@@ -22,6 +22,7 @@
 #include "hw/arm/patcher.h"
 #include "qemu/bitops.h"
 #include "qemu/error-report.h"
+#include "system/hw_accel.h"
 
 #define NOP       (0xD503201F)
 #define MOV_W0_0  (0x52800000)
@@ -267,16 +268,28 @@ static void ck_kp_apfs_patches(CKPatcherRange* range)
     // idea as the mount-time check: drop the `tbnz` that gates the panic so a
     // volume edited after restore boots anyway, the way a development kernel
     // would.
-    static const uint8_t seal_broken_pattern[] = {
-        0x00, 0x00, 0x00, 0x94,    // bl <query the seal's own recorded state>
-        0x00, 0x00, 0x70, 0x37,    // tbnz w0, #0xE, <panic: root volume seal is broken>
-    };
-    static const uint8_t seal_broken_mask[] = {0x00, 0x00, 0x00, 0xFC, 0x1F, 0x00, 0xF8, 0xFF};
-    QEMU_BUILD_BUG_ON(sizeof(seal_broken_pattern) != sizeof(seal_broken_mask));
-    static const uint8_t seal_broken_repl[] = {NOP_BYTES};
-    ck_patcher_find_replace(range, "root volume seal is broken -- allow it anyway", seal_broken_pattern,
-                            seal_broken_mask, sizeof(seal_broken_pattern), sizeof(uint32_t), seal_broken_repl, NULL, 4,
-                            sizeof(seal_broken_repl));
+    //
+    // Only needed -- and only pattern-matched against -- the Mac HVF dev
+    // stand's own kernelcache (iOS 16.3.1, release), for the one workflow
+    // that hand-edits launchd.plist on an already-restored System volume. A
+    // fresh restore never trips the check this guards in the first place, so
+    // there is nothing to gain by matching this pattern against some other
+    // kernelcache (a phone restore's research build, say) and every reason
+    // not to: a byte pattern is not a proof of intent, and a coincidental hit
+    // elsewhere in a kernel this was never checked against silently
+    // overwrites four bytes of something else entirely.
+    if (hwaccel_enabled()) {
+        static const uint8_t seal_broken_pattern[] = {
+            0x00, 0x00, 0x00, 0x94,    // bl <query the seal's own recorded state>
+            0x00, 0x00, 0x70, 0x37,    // tbnz w0, #0xE, <panic: root volume seal is broken>
+        };
+        static const uint8_t seal_broken_mask[] = {0x00, 0x00, 0x00, 0xFC, 0x1F, 0x00, 0xF8, 0xFF};
+        QEMU_BUILD_BUG_ON(sizeof(seal_broken_pattern) != sizeof(seal_broken_mask));
+        static const uint8_t seal_broken_repl[] = {NOP_BYTES};
+        ck_patcher_find_replace(range, "root volume seal is broken -- allow it anyway", seal_broken_pattern,
+                                seal_broken_mask, sizeof(seal_broken_pattern), sizeof(uint32_t), seal_broken_repl,
+                                NULL, 4, sizeof(seal_broken_repl));
+    }
 }
 
 static bool ck_kp_tc_callback(void* ctx, uint8_t* buffer)
@@ -791,7 +804,13 @@ void ck_patch_kernel(MachoHeader64* hdr)
 
     img4_text = ck_kp_find_image_text(hdr, "com.apple.security.AppleImage4");
     ck_kp_img4_patches(img4_text);
-    ck_kp_skip_guarded_nonce_check(img4_text);
+    // Only means anything once ck_patch_virt has forced the non-GXF path
+    // (HVF only, see ck_kp_force_non_gxf_exception_entry) -- on a real target
+    // (TCG, GXF untouched) the check this un-panics is never actually wrong,
+    // so there is nothing to gain from matching this pattern against a
+    // kernelcache it was never validated on, and a coincidental match would
+    // silently overwrite four bytes of something unrelated.
+    if (hwaccel_enabled()) { ck_kp_skip_guarded_nonce_check(img4_text); }
 
     kernel_text = ck_kp_get_kernel_section(hdr, "__TEXT_EXEC", "__text");
     ck_kp_mac_mount_patch(kernel_text);
