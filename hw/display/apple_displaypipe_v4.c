@@ -27,6 +27,7 @@
 #include "hw/registerfields.h"
 #include "qemu/cutils.h"
 #include "qemu/datadir.h"
+#include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "system/dma.h"
 #include "ui/console.h"
@@ -120,34 +121,59 @@ typedef struct
     uint32_t layer_config[ADP_V4_LAYER_COUNT];
 } ADPV4BlendUnitState;
 
+/*
+ * TEMPORARY, reverse-engineered from a live register trace (no symbols for the
+ * guest's PCCMailboxHandler survived os_log's packed argument ABI): the guest
+ * posts a command to 0xE003C (falls back to 0xE0030 on failure) with the low
+ * bit set, then strobes a doorbell at 0xD800C (write 0x8, then 0x0), polling a
+ * status pair (0xE0044/0xD840C, or 0xE0038) each time. Once 0xD840C reports
+ * ready, the guest ACKs it (write 0xD840C <- 0) and moves to a *second*
+ * doorbell at 0xD8010, with the same ring/poll shape -- this only showed up
+ * once the first stage actually reported ready, so it was never in the
+ * original (all-zero) trace. Both stages together still have to fit in the
+ * guest's fixed retry budget (5 outer attempts for 0xE003C, 4 for 0xE0030) or
+ * it gives up anyway. Track the one outstanding command here and report each
+ * stage ready after its own first full doorbell strobe. Remove once the real
+ * M3 mailbox protocol (and the meaning of "ready" here) is confirmed instead
+ * of guessed.
+ */
+typedef struct
+{
+    hwaddr   cmd_reg;
+    uint32_t cmd_val;
+    bool     doorbell1_seen;
+    bool     doorbell2_seen;
+} ADPV4PCCMailboxState;
+
 struct AppleDisplayPipeV4State
 {
     /*< private >*/
     SysBusDevice parent_obj;
 
     /*< public >*/
-    MemoryRegion        up_regs;
-    uint32_t            width;
-    uint32_t            height;
-    MemoryRegion*       vram_mr;
-    uint64_t            vram_off;
-    uint64_t            vram_size;
-    uint64_t            fb_off;
-    MemoryRegion*       dma_mr;
-    AddressSpace        dma_as;
-    qemu_irq            irqs[9];
-    uint32_t            int_status;
-    uint32_t            int_enable;
-    uint32_t            commit_pending;
-    QEMUTimer*          vsync_timer;
-    uint64_t            next_vsync_ns;
-    ADPV4GenPipe        genpipe[ADP_V4_GP_COUNT];
-    ADPV4BlendUnitState blend_unit;
-    QemuConsole*        console;
-    QEMUBH*             update_disp_image_bh;
-    QEMUTimer*          boot_splash_timer;
+    MemoryRegion          up_regs;
+    uint32_t              width;
+    uint32_t              height;
+    MemoryRegion*         vram_mr;
+    uint64_t              vram_off;
+    uint64_t              vram_size;
+    uint64_t              fb_off;
+    MemoryRegion*         dma_mr;
+    AddressSpace          dma_as;
+    qemu_irq              irqs[9];
+    uint32_t              int_status;
+    uint32_t              int_enable;
+    uint32_t              commit_pending;
+    QEMUTimer*            vsync_timer;
+    uint64_t              next_vsync_ns;
+    ADPV4GenPipe          genpipe[ADP_V4_GP_COUNT];
+    ADPV4BlendUnitState   blend_unit;
+    ADPV4PCCMailboxState  pcc_mbox;
+    QemuConsole*          console;
+    QEMUBH*               update_disp_image_bh;
+    QEMUTimer*            boot_splash_timer;
     /* When the display pipe last put a frame up; see adp_v4_gfx_update. */
-    int64_t             last_present_ns;
+    int64_t               last_present_ns;
 };
 
 // clang-format off
@@ -460,6 +486,54 @@ static void adp_v4_reg_write(void* opaque, hwaddr addr, uint64_t data, unsigned 
         addr -= 0x200000;
     }
 
+    // TEMPORARY: reverse-engineering the PCC mailbox protocol -- see
+    // PCCMailboxHandler::outbox_read_callback "unexpected command: 0" in the
+    // guest console. Remove once the mailbox is actually implemented.
+    if (addr >= 0xB0000 && addr < 0xF0000) {
+        warn_report("disp: PCC write @ 0x" HWADDR_FMT_plx " <- 0x%" PRIx64 " (size %u)", addr, data, size);
+
+        switch (addr) {
+            case 0xE003C:
+            case 0xE0030: {
+                if (data & 1) {
+                    adp->pcc_mbox.cmd_reg        = addr;
+                    adp->pcc_mbox.cmd_val        = (uint32_t)data;
+                    adp->pcc_mbox.doorbell1_seen = false;
+                    adp->pcc_mbox.doorbell2_seen = false;
+                }
+                else if (adp->pcc_mbox.cmd_reg == addr) {
+                    adp->pcc_mbox.cmd_reg = 0;
+                }
+                break;
+            }
+            case 0xD800C: {
+                if (data == 0 && adp->pcc_mbox.cmd_reg != 0) {
+                    adp->pcc_mbox.doorbell1_seen = true;
+                    // Interrupt index 8 ("M3", per the block comment above) is wired
+                    // to the AIC by t8030_create_display but nothing ever raises it --
+                    // real hardware likely signals mailbox completion this way, not
+                    // just through the polled status registers. Pulse it and see.
+                    qemu_irq_pulse(adp->irqs[8]);
+                    qatomic_or(&adp->int_status, R_CONTROL_INT_M3_MASK);
+                    adp_v4_update_irqs(adp);
+                }
+                break;
+            }
+            case 0xD8010: {
+                if (data == 0 && adp->pcc_mbox.cmd_reg != 0 && adp->pcc_mbox.doorbell1_seen) {
+                    adp->pcc_mbox.doorbell2_seen = true;
+                    qemu_irq_pulse(adp->irqs[8]);
+                    qatomic_or(&adp->int_status, R_CONTROL_INT_PCC_MASK);
+                    adp_v4_update_irqs(adp);
+                }
+                break;
+            }
+            default: {
+                break;
+            }
+        }
+    }
+
     if (addr >= GP_BLOCK_BASE_FOR(0) && addr < (BLEND_BLOCK_BASE + BLEND_BLOCK_SIZE)
         && qatomic_read(&adp->commit_pending))
     {
@@ -515,6 +589,20 @@ static uint64_t adp_v4_reg_read(void* const opaque, hwaddr addr, unsigned size)
 
     if (addr >= 0x200000) {    // ditto
         addr -= 0x200000;
+    }
+
+    // TEMPORARY: see the write side.
+    if (addr >= 0xB0000 && addr < 0xF0000) {
+        warn_report("disp: PCC read @ 0x" HWADDR_FMT_plx " (size %u)", addr, size);
+
+        if (adp->pcc_mbox.cmd_reg != 0) {
+            if (adp->pcc_mbox.doorbell1_seen) {
+                if (addr == 0xD840C) { return 1; }
+                if (addr == 0xE0044 && adp->pcc_mbox.cmd_reg == 0xE003C) { return 1; }
+                if (addr == 0xE0038 && adp->pcc_mbox.cmd_reg == 0xE0030) { return 1; }
+            }
+            if (adp->pcc_mbox.doorbell2_seen && addr == 0xD8010) { return 1; }
+        }
     }
 
     if (addr >= GP_BLOCK_BASE_FOR(0) && addr < GP_BLOCK_END_FOR(0)) {
