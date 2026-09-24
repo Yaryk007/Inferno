@@ -125,23 +125,33 @@ typedef struct
  * TEMPORARY, reverse-engineered from a live register trace (no symbols for the
  * guest's PCCMailboxHandler survived os_log's packed argument ABI): the guest
  * posts a command to 0xE003C (falls back to 0xE0030 on failure) with the low
- * bit set, then strobes a doorbell at 0xD800C (write 0x8, then 0x0), polling a
- * status pair (0xE0044/0xD840C, or 0xE0038) each time. Once 0xD840C reports
- * ready, the guest ACKs it (write 0xD840C <- 0) and moves to a *second*
- * doorbell at 0xD8010, with the same ring/poll shape -- this only showed up
- * once the first stage actually reported ready, so it was never in the
- * original (all-zero) trace. Both stages together still have to fit in the
- * guest's fixed retry budget (5 outer attempts for 0xE003C, 4 for 0xE0030) or
- * it gives up anyway. Track the one outstanding command here and report each
+ * bit set, then strobes a doorbell at 0xD800C, polling a status pair
+ * (0xE0044/0xD840C, or 0xE0038) each time. Once 0xD840C reports ready, the
+ * guest ACKs it (write 0xD840C <- 0) and moves to a *second* doorbell at
+ * 0xD8010, with the same ring/poll shape -- this only showed up once the
+ * first stage actually reported ready, so it was never in the original
+ * (all-zero) trace. Both stages together still have to fit in the guest's
+ * fixed retry budget (5 outer attempts for 0xE003C, 4 for 0xE0030) or it
+ * gives up anyway. Track the one outstanding command here and report each
  * stage ready after its own first full doorbell strobe. Remove once the real
  * M3 mailbox protocol (and the meaning of "ready" here) is confirmed instead
  * of guessed.
+ *
+ * The strobe's own encoding turned out to vary by guest kernel: iOS 16.3.1 on
+ * the Mac dev stand rings 0xD800C/0xD8010 with a plain write 0x8 then 0x0,
+ * but an iOS 14 research kernelcache on the phone rings 0xD8010 with 0x9 then
+ * 0x1 -- same falling edge of bit 3, different bit 0 riding along with it (an
+ * iteration count or toggle, not part of the strobe). Recognizing the ring as
+ * "bit 3 was set, then a later write clears it" rather than an exact value
+ * covers both.
  */
 typedef struct
 {
     hwaddr   cmd_reg;
     uint32_t cmd_val;
+    bool     doorbell1_armed;
     bool     doorbell1_seen;
+    bool     doorbell2_armed;
     bool     doorbell2_seen;
 } ADPV4PCCMailboxState;
 
@@ -496,10 +506,12 @@ static void adp_v4_reg_write(void* opaque, hwaddr addr, uint64_t data, unsigned 
             case 0xE003C:
             case 0xE0030: {
                 if (data & 1) {
-                    adp->pcc_mbox.cmd_reg        = addr;
-                    adp->pcc_mbox.cmd_val        = (uint32_t)data;
-                    adp->pcc_mbox.doorbell1_seen = false;
-                    adp->pcc_mbox.doorbell2_seen = false;
+                    adp->pcc_mbox.cmd_reg         = addr;
+                    adp->pcc_mbox.cmd_val         = (uint32_t)data;
+                    adp->pcc_mbox.doorbell1_armed = false;
+                    adp->pcc_mbox.doorbell1_seen  = false;
+                    adp->pcc_mbox.doorbell2_armed = false;
+                    adp->pcc_mbox.doorbell2_seen  = false;
                 }
                 else if (adp->pcc_mbox.cmd_reg == addr) {
                     adp->pcc_mbox.cmd_reg = 0;
@@ -507,8 +519,13 @@ static void adp_v4_reg_write(void* opaque, hwaddr addr, uint64_t data, unsigned 
                 break;
             }
             case 0xD800C: {
-                if (data == 0 && adp->pcc_mbox.cmd_reg != 0) {
-                    adp->pcc_mbox.doorbell1_seen = true;
+                if (adp->pcc_mbox.cmd_reg == 0) { break; }
+                if (data & 0x8) {
+                    adp->pcc_mbox.doorbell1_armed = true;
+                }
+                else if (adp->pcc_mbox.doorbell1_armed) {
+                    adp->pcc_mbox.doorbell1_armed = false;
+                    adp->pcc_mbox.doorbell1_seen  = true;
                     // Interrupt index 8 ("M3", per the block comment above) is wired
                     // to the AIC by t8030_create_display but nothing ever raises it --
                     // real hardware likely signals mailbox completion this way, not
@@ -520,8 +537,13 @@ static void adp_v4_reg_write(void* opaque, hwaddr addr, uint64_t data, unsigned 
                 break;
             }
             case 0xD8010: {
-                if (data == 0 && adp->pcc_mbox.cmd_reg != 0 && adp->pcc_mbox.doorbell1_seen) {
-                    adp->pcc_mbox.doorbell2_seen = true;
+                if (adp->pcc_mbox.cmd_reg == 0 || !adp->pcc_mbox.doorbell1_seen) { break; }
+                if (data & 0x8) {
+                    adp->pcc_mbox.doorbell2_armed = true;
+                }
+                else if (adp->pcc_mbox.doorbell2_armed) {
+                    adp->pcc_mbox.doorbell2_armed = false;
+                    adp->pcc_mbox.doorbell2_seen  = true;
                     qemu_irq_pulse(adp->irqs[8]);
                     qatomic_or(&adp->int_status, R_CONTROL_INT_PCC_MASK);
                     adp_v4_update_irqs(adp);
