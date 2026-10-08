@@ -560,6 +560,45 @@ static void break_prepare_jit_region(mach_vm_address_t addr, size_t len)
         "mov x1, %1\n"
         "brk #0x69" ::"r"(addr), "r"(len) : "x0", "x1");
 }
+
+/*
+ * InfernoPatch: a code buffer the app claimed before the machine started.
+ *
+ * Asking the debugger from here is too late on iOS 26. By the time qemu_init
+ * runs, StikDebug has often been suspended by iOS, and a brk to a suspended
+ * debugger stops the whole process with nothing in the log. Even when it
+ * answers, it stays attached for the rest of the session, and every later
+ * signal (QEMU kicks its vCPU threads with one) waits on it.
+ *
+ * So the app asks StikDebug for an executable region at launch, while the
+ * attach is fresh, makes its own writable alias of it, then detaches the
+ * debugger. The two addresses come here through the environment. The RX
+ * pages stay executable after the detach.
+ */
+static bool take_prepared_region(size_t size)
+{
+    const char*        rw_s   = getenv("INFERNO_JIT_RW");
+    const char*        rx_s   = getenv("INFERNO_JIT_RX");
+    const char*        size_s = getenv("INFERNO_JIT_SIZE");
+    unsigned long long rw, rx, have;
+
+    if (!rw_s || !rx_s || !size_s) { return false; }
+    rw   = strtoull(rw_s, NULL, 0);
+    rx   = strtoull(rx_s, NULL, 0);
+    have = strtoull(size_s, NULL, 0);
+    if (!rw || !rx) { return false; }
+    if (have < size) {
+        warn_report("JIT: the prepared region holds %llu bytes, %zu were asked for -- not using it", have, size);
+        return false;
+    }
+
+    region.start_aligned = (void*)(uintptr_t)rw;
+    region.total_size    = size;
+    tcg_splitwx_diff     = (const void*)(uintptr_t)rx - (void*)(uintptr_t)rw;
+    info_report("JIT: using the region claimed at launch, %zu bytes, rw %p rx %p", size, (void*)(uintptr_t)rw,
+                (void*)(uintptr_t)rx);
+    return true;
+}
             #endif
 
 static int alloc_code_gen_buffer_splitwx_vmremap(size_t size, Error** errp)
@@ -571,6 +610,8 @@ static int alloc_code_gen_buffer_splitwx_vmremap(size_t size, Error** errp)
     int orig_prot = PROT_READ | PROT_WRITE;
 
     #if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
+    if (take_prepared_region(size)) { return PROT_READ | PROT_WRITE; }
+
     /* Under TXM the first mapping has to start out executable. */
     if (__builtin_available(iOS 26, *)) { orig_prot = PROT_READ | PROT_EXEC; }
     #endif
